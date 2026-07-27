@@ -9,6 +9,10 @@
 #include <functional>
 #include <memory>
 #include <fcntl.h>
+#include "logging.h"
+#include <string>
+#include "reactor.h"
+#include "thread_pool.h"
 
 class NBSocket {
 public:
@@ -20,29 +24,39 @@ public:
         }
     }
 
-    bool Socket(uint16_t port) {
+    bool Socket(uint16_t port, const std::string& ip = "0.0.0.0") {
         fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if(fd_ < 0) {
+            LOG_ERROR << "socket failed" << std::endl;
             return false;
         }
 
         int opt = 1;
-        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        if(setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            LOG_INFO << "setsockopt failed";
+        }
 
         sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htonl(port);
+        addr.sin_port = htons(port);
+        if(inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) <= 0) {
+            LOG_ERROR << "Invalid IP address:" << ip;
+            return false;
+        }
 
         if(bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            LOG_ERROR << "bind failed" << std::endl;
             return false;
         }
 
         if(listen(fd_, 128) < 0) {
+            LOG_ERROR << "listen faield" << std::endl;
             return false;
         }
         
+        LOG_INFO << "Seerver listening on" << ip << ":" << port << std::endl;
+
         return true;
 
     }
@@ -53,6 +67,17 @@ public:
         int client_fd = accept(fd_, (sockaddr*)&client_addr, &len);
         int flags = fcntl(client_fd, F_GETFL, 0);
         fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+
+        if(client_fd < 0) {
+            if(errno != EAGAIN && errno != EWOULDBLOCK) {
+                LOG_ERROR << "accept failed " << strerror(errno); 
+            }
+            return -1;
+        }
+
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        LOG_DEBUG << "Accepted connection from " << client_ip << ":" << ntohs(client_addr.sin_port);
 
         return client_fd;
     }
@@ -71,6 +96,9 @@ class EpollWrapper {
 public:
     EpollWrapper() {
         epfd_ = epoll_create1(0);
+        if(epfd_ < 0) {
+            LOG_FATAL << "epoll_creat failed: " << strerror(errno);
+        }
     }
     ~EpollWrapper() {
         if(epfd_ < 0) {
@@ -83,7 +111,12 @@ public:
         ev.events = events;
         ev.data.ptr = ptr;
 
-        return epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev) == 0;
+        if(epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev)) {
+            LOG_ERROR << "epoll_ctl_add failed for fd :" << fd << ":" << strerror(errno);
+            return false;
+        }
+
+        return true;
     }
 
     bool mod(int fd, uint32_t events, void* ptr = nullptr) {
@@ -91,17 +124,34 @@ public:
         ev.events = events;
         ev.data.ptr = ptr;
 
-        return epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0;
+        if(epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0) {
+            LOG_ERROR << "epoll_ctl_mod failed for fd" << fd << ":" << strerror(errno);
+            return false;
+        }
+
+        return true;
     }
 
     bool del(int fd) {
-        return epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) == 0;
+        if(epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) == 0) {
+            LOG_ERROR << "epoll_ctl_del failed for fd" << fd << ":" << strerror(errno);
+            return false;
+        }
+        return true;
     }
 
     int wait(std::vector<epoll_event>& events, int timeout = -1) {
         events.resize(1024);
         int n = epoll_wait(epfd_, events.data(), events.size(), timeout);
         
+        if(n < 0) {
+            if(errno != EINTR) {
+                LOG_ERROR << "epoll_wait failed: " << strerror(errno);
+            }
+            return n;
+        }
+
+
         if(n > 0) {
             events.resize(n);
         }
@@ -154,6 +204,9 @@ public:
         return std::string(peek(), readBytes());
     }
 
+    size_t size() const{
+        return buffer_.size();
+    }
 
 private:
     std::vector<char> buffer_;
@@ -162,15 +215,19 @@ private:
 
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
+public:
     using Callback = std::function<void(std::shared_ptr<TcpConnection>)>;
+    using MessageCallback = std::function<void(std::shared_ptr<TcpConnection>, Buffer&)>;
 
-    TcpConnection(int fd) : fd_(fd), closed_(false) {
-        output_buffer.Append("Hello from server", 19);
+    TcpConnection(int fd, int id = 0) : fd_(fd), connection_id(id), closed_(false), context(nullptr) {
+        output_buffer.Append("Hello from server", 17);
+        LOG_DEBUG << "Connection created: fd" << fd << std::endl;
     }
 
     ~TcpConnection() {
         if(fd_ > 0) {
             close(fd_);
+            LOG_DEBUG << "Connection closed: fd" << fd_ << std::endl;
         }
     }
 
@@ -182,8 +239,8 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
         return output_buffer;
     }
 
-    void setReadCallBack(Callback cb) {
-        read_cb = cb;
+    void setMessageCallback(MessageCallback cb) {
+        message_cb = cb;
     }
 
     void setWriteCallBack(Callback cb) {
@@ -196,50 +253,109 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
     
     void handleRead() {
         char buf[1024];
-        ssize_t n = read(fd_, buf, sizeof(buf));
-        if(n > 0) {
-            input_buffer.Append(buf, n);
+        while(true) {
+            ssize_t n = read(fd_, buf, sizeof(buf));
+            if(n > 0) {
+                input_buffer.Append(buf, n);
+            }
+            else if(n == 0) {
+                handleClose();
+                break;
+            }
+            else if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            else {
+                LOG_ERROR << "Read error" << strerror(errno);
+                handleClose();
+                break;
+            }
         }
-        else if(n == 0) {
-            handleClose();
+        if(!closed_ && input_buffer.readBytes() > 0) {
+            if(message_cb) {
+                message_cb(shared_from_this(), input_buffer);
+            }
         }
     }
 
     void handleWrite() {
-        size_t len = output_buffer.readBytes();
-        if(len > 0) {
-            ssize_t n = write(fd_, output_buffer.peek(), len);
+        while(output_buffer.readBytes() > 0) {
+            ssize_t n = write(fd_, output_buffer.peek(), output_buffer.readBytes());
             if(n > 0) {
                 output_buffer.costBytes(n);
             }
+            else if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            else {
+                LOG_ERROR << "Write error" << strerror(errno);
+                handleClose();
+                break;
+            }
         }
-        if(output_buffer.readBytes() == 0 && write_cb) {
-            write_cb(shared_from_this());
+        if(!closed_ && output_buffer.readBytes() == 0) {
+            if(write_cb) {
+                write_cb(shared_from_this());
+            }
         }
     }
 
     void handleClose() {
-        closed_ = true;
-        if(close_cb) {
-            close_cb(shared_from_this());
+        if(!closed_) {
+            closed_ = true;
+            LOG_INFO << "Connection closed: fd " << fd_ << std::endl;
+            if(close_cb) {
+                close_cb(shared_from_this());
+            }
         }
     }
 
     void send(const std::string& msg) {
-        output_buffer.Append(msg.data(), msg.size());
+        if(!closed_) {
+            output_buffer.Append(msg.data(), msg.size());
+            handleWrite();
+        }
     }
 
+    void send(const char* data, size_t len) {
+        if(!closed_) {
+            output_buffer.Append(data, len);
+            handleWrite();
+        }
+    }
+
+    void sendToBuffer(const std::string& msg) {
+        if(!closed_) {
+            output_buffer.Append(msg.data(), msg.size());
+        }
+    }
+    
+    void sendToBuffer(const char* data, size_t len) {
+        if(!closed_) {
+            output_buffer.Append(data, len);
+        }
+    }
 
     int fd() const {
         return fd_;
     }
 
+    int id() const {
+        return connection_id;
+    }
+
+    bool isClosed() {
+        return closed_;
+    }
+
 private:
     int fd_;
+    int connection_id;
     bool closed_;
     Buffer input_buffer;
     Buffer output_buffer;
-    Callback read_cb;
     Callback write_cb;
     Callback close_cb;
+    MessageCallback message_cb;
+    void* context;
 };
