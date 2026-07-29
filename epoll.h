@@ -251,6 +251,18 @@ public:
         close_cb = cb;
     }
     
+    void setContext (void* ctx) {
+        context = ctx;
+    };
+
+    void* getContext() {
+        return context;
+    }
+
+    uint64_t getUserID() const{
+        return reinterpret_cast<uint64_t>(context);
+    }
+
     void handleRead() {
         char buf[1024];
         while(true) {
