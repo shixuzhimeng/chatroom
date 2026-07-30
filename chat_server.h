@@ -34,8 +34,23 @@ public:
     
         //注册业务处理器
         registerHandler();
+
+        LOG_INFO << "ChatServer init on" << host_ << ":" << port_;
     }
 
+    void start() {
+        main_reactor_->start();
+        LOG_INFO << "ChatServer started";
+    }
+
+    void stop() {
+        main_reactor_->stop();
+        if(thread_pool_) {
+            thread_pool_.reset();
+        }
+
+        LOG_INFO << "ChatServer stopped";
+    }
     
 
 private:

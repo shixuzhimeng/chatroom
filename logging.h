@@ -27,32 +27,29 @@
 #define LOG_EVERY_N_WARN(n) LOG_EVERY_N(WARNING, n) << "[WARN] "
 #define LOG_EVERY_N_ERROR(n) LOG_EVERY_N(ERROR, n) << "[ERROR] "
 
-class LogInit{
-public:
-    static void init(const std::string& program_name, const std::string& log_dir = "./logs", bool logtostderr = false) {
-        google::InitGoogleLogging(program_name.c_str());
+inline void LOGinit(const std::string& program_name, const std::string& log_dir = "./logs", bool logtostderr = false) {
+    google::InitGoogleLogging(program_name.c_str());
 
-        // 设置日志的目录
-        FLAGS_log_dir = log_dir;
-        FLAGS_logtostderr = logtostderr;
+    // 设置日志的目录
+    FLAGS_log_dir = log_dir;
+    FLAGS_logtostderr = logtostderr;
 
-        // 设置最低级别的日志输出
-        FLAGS_minloglevel = google::INFO;
+    // 设置最低级别的日志输出
+    FLAGS_minloglevel = google::INFO;
 
-        // 设置日志文件的大小
-        FLAGS_max_log_size = 100;
+    // 设置日志文件的大小
+    FLAGS_max_log_size = 100;
 
-        // 保留日志文件的数量
-        FLAGS_logbufsecs = 0;
-  
-        // 日志颜色区分
-        FLAGS_colorlogtostderr = logtostderr;
+    // 保留日志文件的数量
+    FLAGS_logbufsecs = 0;
+
+    // 日志颜色区分
+    FLAGS_colorlogtostderr = logtostderr;
 
 
-        LOG_INFO << "LOG system init , Program: " << program_name;
-    }
+    LOG_INFO << "LOG system init , Program: " << program_name;
+}
 
-    static void shutdwn() {
-        google::ShutdownGoogleLogging();
-    }
-};
+static void shutdwn() {
+    google::ShutdownGoogleLogging();
+}
