@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package p;
+
+enum MessageType {
+    MSG_UNKNOWN = 0;
+    MSG_LOGIN = 1;
+    MSG_LOGOUT = 2;
+    MSG_ECHO = 3;
+    MSG_HEARTBEAT = 4;
+    MSG_CHAT = 5;
+    MSG_FRIEND_REQUEST = 6;
+    MSG_FRIEND_RESPONSE = 7;
+    MSG_GROUP_CREATE = 8;
+    MSG_GROUP_JOIN = 9;
+    MSG_GROUP_LEAVE = 10;
+    MSG_REGISTER = 11;
+    MSG_VERIFICATION_CODE = 12;
+}
+
+message MessageHeader {
+    uint32 msg_id = 1;
+    MessageType msg_type = 2;
+    uint32 body_length = 3;
+    uint64 timestamp = 4;
+    uint64 from_uid = 5;
+    uint64 to_uid = 6;
+}
+
+message LoginRequest {
+    string username = 1;
+    string password = 2;
+    string device_id = 3;
+}
+
+message LoginResponse {
+    bool success = 1;
+    string token = 2;
+    string message = 3;
+    uint64 uid = 4;
+    string nickname = 5;
+}
+
+message ChatMessage {
+    uint64 from_uid = 1;
+    uint64 to_uid = 2;
+    string content = 3;
+    uint32 msg_type = 4;
+    string extra = 5;
+}
+
+message FriendRequest {
+    uint64 from_uid = 1;
+    uint64 to_uid = 2;
+    string message = 3;
+}
+
+message FriendResponse {
+    uint64 from_uid = 1;
+    uint64 to_uid = 2;
+    bool accept = 3;
+}
+
+message GroupCreate {
+    string group_name = 1;
+    string description = 2;
+    repeated uint64 members = 3;
+}
+
+message GroupJoin {
+    uint64 group_id = 1;
+    uint64 user_id = 2;
+}
+
+message EchoRequest {
+    string content = 1;
+}
+
+message EchoResponse {
+    string content = 1;
+}
+
+message Heartbeat {
+    uint64 timestamp = 1;
+}
+
+message CommonResponse {
+    int32 code = 1;
+    string message = 2;
+    uint64 timestamp = 3;
+}
+
+
+// 注册请求
+message RegisterRequest {
+    string username = 1;
+    string password = 2;
+    string email = 3;
+    string nickname = 4;
+    string verification_code = 5;
+}
+
+// 注销请求
+message LogoutRequest {
+    string token = 1;
+}
+
+// 验证码请求
+message CodeRequest {
+    string email = 1;
+}
+
+// 验证码响应
+message CodeResponse {
+    string code = 1;
+    int32 expire_seconds = 2;
+}
