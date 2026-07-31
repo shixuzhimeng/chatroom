@@ -1,3 +1,5 @@
+#pragma once
+
 #include <mysql/mysql.h>
 #include <string>
 #include <queue>
@@ -25,6 +27,9 @@ public:
         
         // 连接
         if(!mysql_real_connect(conn_, host.c_str(), user.c_str(), password.c_str(), database.c_str(), port, nullptr, 0)) {
+            std::string error = mysql_error(conn_);
+            mysql_close(conn_);
+            conn_ = nullptr;
             throw std::runtime_error("MySQL connect failed");
         }
 
@@ -87,6 +92,7 @@ public:
         
         // 创建预连接
         try {
+            auto conn = createConnection();
             for(int i = 0; i < min; i++) {
                 auto conn = createConnection();
 

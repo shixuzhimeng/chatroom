@@ -12,7 +12,7 @@ class BaseDAO {
 public:
     virtual ~BaseDAO() = default;
 
-private:
+protected:
     // 查询操作
     bool executeQuery(const std::string& sql, std::vector<std::map<std::string, std::string>>& result) {
         putbackConnection conn;
@@ -78,7 +78,7 @@ private:
     }
 
     // 防止SQL注入
-    std::string escaped(const std::string& str) {
+    std::string escapeString(const std::string& str) {
         putbackConnection conn;
         if(!conn.connect()) {
             return str;
@@ -93,6 +93,20 @@ private:
 
     // 将数据转换为SQL语句
     std::string bulidSentence(const std::map<std::string, std::string>& conditions) {
-        
+        if(conditions.empty()) {
+            return "";
+        }
+        std::string where = "WHERE";
+        bool first = true;
+        for (const auto& pair : conditions) {
+            const auto& key = pair.first;
+            const auto& value = pair.second;
+            if(!first) {
+                where += "AND";
+            }
+            where += key + " = '" + escapeString(value) + "'";
+            first = false;
+        }
+        return where;
     }
 };
