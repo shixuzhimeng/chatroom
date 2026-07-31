@@ -35,7 +35,7 @@ public:
     }
 
     template<typename T>
-    T get(const std::string& key, const T& default_value = T()) const{
+    T get(const std::string& key, const T default_value = T()) const{
         try {
             if(config_.contains(key)) {
                 return config_[key].get<T>();
@@ -46,6 +46,26 @@ public:
         }
 
         return default_value;
+    }
+
+    template<typename T>
+    void set(const std::string& key, const T& value) {
+        json* current = &config_;
+        size_t start = 0;
+        size_t end = key.find('.');
+
+        while (end != std::string::npos) {
+            std::string part = key.substr(start, end - start);
+            if (!current->contains(part)) {
+                (*current)[part] = json::object();
+            }
+            current = &(*current)[part];
+            start = end + 1;
+            end = key.find('.', start);
+        }
+
+        std::string last_key = key.substr(start);
+        (*current)[last_key] = value;
     }
 
     std::string getString(const std::string& key, const std::string& default_value = "") const{
@@ -71,3 +91,6 @@ public:
 private:
     json config_;
 };
+
+#define LOAD_CONFIG(path) Config::getInstance().load(path)
+#define GET_CONFIG(key, default_val) Config::getInstance().get(key, default_val)
