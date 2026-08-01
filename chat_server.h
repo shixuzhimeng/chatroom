@@ -9,7 +9,7 @@
 #include <memory>
 #include <unordered_map>
 #include <atomic>
-
+#include "Account.h"
 
 class ChatServer{
 public:
@@ -54,6 +54,8 @@ public:
     
 
 private:
+    AuthHandler auth_handler_;
+
     void handleMessage(std::shared_ptr<TcpConnection> conn, Buffer& buffer) {
         while(buffer.readBytes() >= sizeof(uint32_t)) {
             p::MessageHeader header;
@@ -100,6 +102,19 @@ private:
         dispatcher_.registerHandle(p::MSG_FRIEND_REQUEST, [this](auto conn, auto& header, auto& body) {
             handlefriendRequest(conn, header, body);
         });
+
+        dispatcher_.registerHandle(p::MSG_REGISTER, 
+            [this](auto conn, auto& header, auto& body) {
+                auth_handler_.handleRegister(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_LOGOUT,
+            [this](auto conn, auto& header, auto& body) {
+                auth_handler_.handleLogout(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_VERIFICATION_CODE,
+            [this](auto conn, auto& header, auto& body) {
+                auth_handler_.handleVerifyCode(conn, header, body);
+            });
 
         LOG_INFO << "Registered " << dispatcher_.handlesCount() << "message handle"; 
     }
