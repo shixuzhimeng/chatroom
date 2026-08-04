@@ -10,6 +10,9 @@
 #include <unordered_map>
 #include <atomic>
 #include "Account.h"
+#include "friend/FriendHandle.h"
+#include "friend/OnlineManager.h"
+#include <chrono>
 
 class ChatServer{
 public:
@@ -33,23 +36,41 @@ public:
     );
     
         //注册业务处理器
-        registerHandler();
+        registerHandle();
 
-        LOG_INFO << "ChatServer init on" << host_ << ":" << port_;
+        LOG_INFO << "pServer init on" << host_ << ":" << port_;
     }
+
+    ~ChatServer() { stop(); }
 
     void start() {
         main_reactor_->start();
-        LOG_INFO << "ChatServer started";
+
+        friend_handler_.setConnection([this](uint64_t uid)->std::shared_ptr<TcpConnection> {
+            auto it = user_connections_.find(uid);
+            if(it != user_connections_.end()) {
+                return it->second;
+            }
+            return nullptr;
+        });
+
+        timeout_thread_ = std::thread([this]() {
+            while (running_) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                OnlineManager::getInstance().checkTimeout(30);
+            }
+        });
+        LOG_INFO << "pServer started";
     }
 
     void stop() {
-        main_reactor_->stop();
-        if(thread_pool_) {
-            thread_pool_.reset();
-        }
+        running_ = false;
 
-        LOG_INFO << "ChatServer stopped";
+        if (timeout_thread_.joinable()) timeout_thread_.join();
+        if (main_reactor_) main_reactor_->stop();
+        if (thread_pool_) thread_pool_.reset();
+
+        LOG_INFO << "pServer stopped";
     }
     
 
@@ -76,7 +97,7 @@ private:
         }
     }
 
-    void registerHandler() {
+    void registerHandle() {
         
         // 登录处理
         dispatcher_.registerHandle(p::MSG_LOGIN, [this](auto conn, auto& header, auto& body) {
@@ -94,9 +115,10 @@ private:
         });
 
         // 聊天处理
-        dispatcher_.registerHandle(p::MSG_CHAT, [this](auto conn, auto& header, auto& body) {
-            handleChat(conn, header, body);
-        });
+        dispatcher_.registerHandle(p::MSG_CHAT,
+            [this](auto conn, auto& header, auto& body) {
+                handleChat(conn, header, body);
+            });
 
         //好友请求处理
         dispatcher_.registerHandle(p::MSG_FRIEND_REQUEST, [this](auto conn, auto& header, auto& body) {
@@ -116,6 +138,34 @@ private:
                 auth_handler_.handleVerifyCode(conn, header, body);
             });
 
+         dispatcher_.registerHandle(p::MSG_ADD_FRIEND,
+            [this](auto conn, auto& header, auto& body) {
+                friend_handler_.handleAddFriend(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_PROCESS_FRIEND_REQUEST,
+            [this](auto conn, auto& header, auto& body) {
+                friend_handler_.handleProcessFriendRequest(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_FRIEND_LIST,
+            [this](auto conn, auto& header, auto& body) {
+                friend_handler_.handleGetFriendList(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_DELETE_FRIEND,
+            [this](auto conn, auto& header, auto& body) {
+                friend_handler_.handleDeleteFriend(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_BLOCK_USER,
+            [this](auto conn, auto& header, auto& body) {
+                friend_handler_.handleBlockUser(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_UNBLOCK_USER,
+            [this](auto conn, auto& header, auto& body) {
+                friend_handler_.handleUnblockUser(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_BLOCK_LIST,
+            [this](auto conn, auto& header, auto& body) {
+                friend_handler_.handleGetBlockList(conn, header, body);
+            });
         LOG_INFO << "Registered " << dispatcher_.handlesCount() << "message handle"; 
     }
 
@@ -136,7 +186,7 @@ private:
 
         // 验证密码
         p::LoginResponse response;
-        if(found && user.passward_hash == request.password()) {
+        if(found && user.password_hash == request.password()) {
             response.set_success(true);
             response.set_token("token_" + std::to_string(user.user_id));
             response.set_uid(user.user_id);
@@ -167,6 +217,7 @@ private:
         if(data.empty()) {
             conn->send(data.data(), data.size());
         }
+
     }
 
     void handleEcho(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
@@ -207,11 +258,11 @@ private:
     void handleChat(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
         p::ChatMessage message;
         if(!message.ParseFromArray(body.data(), body.size())) {
-            LOG_ERROR << "Parse ChatMessage failed";
+            LOG_ERROR << "Parse pMessage failed";
             return ;
         }
 
-        LOG_INFO << "Chat from " << message.from_uid() << "to " << message.to_uid() << ": " << message.content();
+        LOG_INFO << "p from " << message.from_uid() << "to " << message.to_uid() << ": " << message.content();
 
         auto it = user_connections_.find(message.to_uid());
         if(it != user_connections_.end()) {
@@ -278,4 +329,7 @@ private:
     std::unique_ptr<MainReactor> main_reactor_;
     proto::Dispatch dispatcher_;
     std::unordered_map<uint64_t, std::shared_ptr<TcpConnection>> user_connections_;
+    friendHandle friend_handler_;
+    std::thread timeout_thread_;
+    std::atomic<bool> running_;
 };

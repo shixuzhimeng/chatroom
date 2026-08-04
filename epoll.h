@@ -65,16 +65,17 @@ public:
         socklen_t len = sizeof(client_addr);
         
         int client_fd = accept(fd_, (sockaddr*)&client_addr, &len);
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-
+        
         if(client_fd < 0) {
             if(errno != EAGAIN && errno != EWOULDBLOCK) {
                 LOG_ERROR << "accept failed " << strerror(errno); 
             }
             return -1;
         }
-
+        
+        int flags = fcntl(client_fd, F_GETFL, 0);
+        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+ 
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         LOG_DEBUG << "Accepted connection from " << client_ip << ":" << ntohs(client_addr.sin_port);
@@ -101,7 +102,7 @@ public:
         }
     }
     ~EpollWrapper() {
-        if(epfd_ < 0) {
+        if(epfd_ > 0) {
             close(epfd_);
         }
     }
@@ -111,7 +112,7 @@ public:
         ev.events = events;
         ev.data.ptr = ptr;
 
-        if(epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev)) {
+        if(epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
             LOG_ERROR << "epoll_ctl_add failed for fd :" << fd << ":" << strerror(errno);
             return false;
         }
@@ -124,7 +125,7 @@ public:
         ev.events = events;
         ev.data.ptr = ptr;
 
-        if(epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0) {
+        if(epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
             LOG_ERROR << "epoll_ctl_mod failed for fd" << fd << ":" << strerror(errno);
             return false;
         }
@@ -133,7 +134,7 @@ public:
     }
 
     bool del(int fd) {
-        if(epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) == 0) {
+        if(epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) < 0) {
             LOG_ERROR << "epoll_ctl_del failed for fd" << fd << ":" << strerror(errno);
             return false;
         }
@@ -183,6 +184,7 @@ public:
     }
 
     const char* peek() const {
+        if (readBytes() == 0) return nullptr;
         return buffer_.data() + read_index;
     }
     
@@ -220,7 +222,6 @@ public:
     using MessageCallback = std::function<void(std::shared_ptr<TcpConnection>, Buffer&)>;
 
     TcpConnection(int fd, int id = 0) : fd_(fd), connection_id(id), closed_(false), context(nullptr) {
-        output_buffer.Append("Hello from server", 17);
         LOG_DEBUG << "Connection created: fd" << fd << std::endl;
     }
 
@@ -264,7 +265,7 @@ public:
     }
 
     void handleRead() {
-        char buf[1024];
+        char buf[1024 * 64];
         while(true) {
             ssize_t n = read(fd_, buf, sizeof(buf));
             if(n > 0) {

@@ -7,6 +7,9 @@
 #include <memory>
 #include <unordered_map>
 #include <functional>
+#include <mutex>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 class Reactor {
 public:
@@ -18,13 +21,25 @@ public:
     virtual void removeConnection(int fd) = 0;
 };
 
-class SubReactor : public Reactor {
+class SubReactor : public Reactor, public std::enable_shared_from_this<SubReactor> {
 public:
     SubReactor(int id, ThreadPool* thread_pool = nullptr) 
-        : id_(id), running_(false), thread_pool_(thread_pool) {
-        epoll_fd_ = epoll_create1(0);
+        : id_(id), running_(false), thread_pool_(thread_pool),
+          epoll_fd_(-1), wakeup_fd_(-1) {
+        epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
         if (epoll_fd_ < 0) {
             LOG_FATAL << "SubReactor " << id_ << " epoll_create failed";
+        }
+        // 创建 eventfd 用于唤醒
+        wakeup_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (wakeup_fd_ < 0) {
+            LOG_FATAL << "SubReactor " << id_ << " eventfd failed";
+        }
+        epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = wakeup_fd_;
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_fd_, &ev) < 0) {
+            LOG_FATAL << "SubReactor " << id_ << " add wakeup fd failed";
         }
         LOG_DEBUG << "SubReactor " << id_ << " created";
     }
@@ -32,14 +47,17 @@ public:
     ~SubReactor() {
         stop();
         if (epoll_fd_ > 0) close(epoll_fd_);
+        if (wakeup_fd_ > 0) close(wakeup_fd_);
     }
     
     void start() override {
-        if (running_) return;
-        running_ = true;
-        
+        bool expected = false;
+        if (!running_.compare_exchange_strong(expected, true)) {
+            return;
+        }
         if (thread_pool_) {
-            thread_pool_->enqueue([this]() { eventLoop(); });
+            auto self = shared_from_this();
+            thread_pool_->enqueue([self]() { self->eventLoop(); });
         } else {
             eventLoop();
         }
@@ -47,34 +65,51 @@ public:
     }
     
     void stop() override {
-        running_ = false;
+        bool expected = true;
+        if (!running_.compare_exchange_strong(expected, false)) {
+            return;
+        }
+        wakeup();  // 唤醒 epoll_wait
         LOG_INFO << "SubReactor " << id_ << " stopping";
     }
     
     void addConnection(int fd) override {
         auto conn = std::make_shared<TcpConnection>(fd, fd);
-        conn->setMessageCallback([this](ConnectionPtr c, Buffer& buf) {
-            if (message_cb_) message_cb_(c, buf);
+        // 使用 weak_ptr 避免循环引用
+        std::weak_ptr<SubReactor> weak_self = shared_from_this();
+        conn->setMessageCallback([weak_self](ConnectionPtr c, Buffer& buf) {
+            auto self = weak_self.lock();
+            if (self && self->message_cb_) {
+                self->message_cb_(c, buf);
+            }
         });
-        conn->setCloseCallBack([this](ConnectionPtr c) {
-            removeConnection(c->fd());
+        conn->setCloseCallBack([weak_self](ConnectionPtr c) {
+            auto self = weak_self.lock();
+            if (self) {
+                self->removeConnection(c->fd());
+            }
         });
+        
+        // 设置非阻塞
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         
         epoll_event ev;
         ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-        ev.data.ptr = conn.get();
+        ev.data.fd = fd;
         
+        std::lock_guard<std::mutex> lock(conn_mutex_);
         if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
             LOG_ERROR << "SubReactor " << id_ << " add connection failed: " 
                      << strerror(errno);
             return;
         }
-        
         connections_[fd] = conn;
         LOG_DEBUG << "SubReactor " << id_ << " add connection " << fd;
     }
     
     void removeConnection(int fd) override {
+        std::lock_guard<std::mutex> lock(conn_mutex_);
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         connections_.erase(fd);
         LOG_DEBUG << "SubReactor " << id_ << " remove connection " << fd;
@@ -85,15 +120,28 @@ public:
     }
     
     int id() const { return id_; }
-    size_t connectionCount() const { return connections_.size(); }
+    size_t connectionCount() const {
+        std::lock_guard<std::mutex> lock(conn_mutex_);
+        return connections_.size();
+    }
+    
+    void wakeup() {
+        if (wakeup_fd_ > 0) {
+            uint64_t one = 1;
+            ssize_t n = write(wakeup_fd_, &one, sizeof(one));
+            if (n < 0 && errno != EAGAIN) {
+                LOG_ERROR << "wakeup write failed: " << strerror(errno);
+            }
+        }
+    }
     
 private:
     void eventLoop() {
         std::vector<epoll_event> events(1024);
+        LOG_INFO << "SubReactor " << id_ << " event loop started";
         
         while (running_) {
             int n = epoll_wait(epoll_fd_, events.data(), events.size(), 100);
-            
             if (n < 0) {
                 if (errno == EINTR) continue;
                 LOG_ERROR << "SubReactor " << id_ << " epoll_wait failed: " 
@@ -102,8 +150,27 @@ private:
             }
             
             for (int i = 0; i < n; ++i) {
-                auto* conn = static_cast<TcpConnection*>(events[i].data.ptr);
-                if (!conn || conn->isClosed()) continue;
+                int fd = events[i].data.fd;
+                if (fd == wakeup_fd_) {
+                    // 消耗唤醒事件
+                    uint64_t dummy;
+                    read(wakeup_fd_, &dummy, sizeof(dummy));
+                    continue;
+                }
+                
+                ConnectionPtr conn;
+                {
+                    std::lock_guard<std::mutex> lock(conn_mutex_);
+                    auto it = connections_.find(fd);
+                    if (it != connections_.end()) {
+                        conn = it->second;
+                    }
+                }
+                if (!conn || conn->isClosed()) {
+                    // 若连接已关闭但未删除，从 epoll 移除
+                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                    continue;
+                }
                 
                 if (events[i].events & (EPOLLIN | EPOLLRDHUP)) {
                     conn->handleRead();
@@ -117,34 +184,39 @@ private:
             }
         }
         
-        for (auto& pair : connections_) {
-            pair.second->handleClose();
+        // 清理所有连接
+        {
+            std::lock_guard<std::mutex> lock(conn_mutex_);
+            for (auto& pair : connections_) {
+                pair.second->handleClose();
+            }
+            connections_.clear();
         }
-        
-        connections_.clear();
         LOG_INFO << "SubReactor " << id_ << " event loop stopped";
     }
     
     int id_;
     int epoll_fd_;
+    int wakeup_fd_;
     std::atomic<bool> running_;
     ThreadPool* thread_pool_;
+    mutable std::mutex conn_mutex_;
     std::unordered_map<int, ConnectionPtr> connections_;
     typename TcpConnection::MessageCallback message_cb_;
 };
 
-class MainReactor : public Reactor {
+class MainReactor : public Reactor, public std::enable_shared_from_this<MainReactor> {
 public:
     MainReactor(const std::string& host, uint16_t port, int sub_count = 4,
                 ThreadPool* thread_pool = nullptr)
         : host_(host), port_(port), sub_count_(sub_count),
-          running_(false), next_sub_(0), thread_pool_(thread_pool) {
+          running_(false), next_sub_(0), thread_pool_(thread_pool),
+          listen_fd_(-1), epoll_fd_(-1), wakeup_fd_(-1) {
         
         listen_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (listen_fd_ < 0) {
             LOG_FATAL << "MainReactor socket creation failed: " << strerror(errno);
         }
-        
         int opt = 1;
         setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         
@@ -152,34 +224,39 @@ public:
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port_);
-        
         if (host_ == "0.0.0.0") {
             addr.sin_addr.s_addr = INADDR_ANY;
         } else {
             inet_pton(AF_INET, host_.c_str(), &addr.sin_addr);
         }
-        
         if (bind(listen_fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
             LOG_FATAL << "MainReactor bind failed: " << strerror(errno);
         }
-        
         if (listen(listen_fd_, SOMAXCONN) < 0) {
             LOG_FATAL << "MainReactor listen failed: " << strerror(errno);
         }
         
-        epoll_fd_ = epoll_create1(0);
+        epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
         if (epoll_fd_ < 0) {
             LOG_FATAL << "MainReactor epoll_create failed: " << strerror(errno);
         }
-        
+        // 唤醒 fd
+        wakeup_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (wakeup_fd_ < 0) {
+            LOG_FATAL << "MainReactor eventfd failed";
+        }
         epoll_event ev;
         ev.events = EPOLLIN | EPOLLET;
+        ev.data.fd = wakeup_fd_;
+        epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wakeup_fd_, &ev);
         ev.data.fd = listen_fd_;
+        ev.events = EPOLLIN | EPOLLET;
         epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev);
         
+        // 创建 SubReactor
         for (int i = 0; i < sub_count_; ++i) {
-            auto sub = std::make_unique<SubReactor>(i, thread_pool_);
-            sub_reactors_.push_back(std::move(sub));
+            auto sub = std::make_shared<SubReactor>(i, thread_pool_);
+            sub_reactors_.push_back(sub);
         }
         
         LOG_INFO << "MainReactor created on " << host_ << ":" << port_ 
@@ -190,27 +267,32 @@ public:
         stop();
         if (listen_fd_ > 0) close(listen_fd_);
         if (epoll_fd_ > 0) close(epoll_fd_);
+        if (wakeup_fd_ > 0) close(wakeup_fd_);
     }
     
     void start() override {
-        if (running_) return;
-        running_ = true;
-        
+        bool expected = false;
+        if (!running_.compare_exchange_strong(expected, true)) {
+            return;
+        }
         for (auto& sub : sub_reactors_) {
             sub->start();
         }
-        
         if (thread_pool_) {
-            thread_pool_->enqueue([this]() { EventLoop(); });
+            auto self = shared_from_this();
+            thread_pool_->enqueue([self]() { self->EventLoop(); });
         } else {
             EventLoop();
         }
-        
         LOG_INFO << "MainReactor started";
     }
     
     void stop() override {
-        running_ = false;
+        bool expected = true;
+        if (!running_.compare_exchange_strong(expected, false)) {
+            return;
+        }
+        wakeup();
         for (auto& sub : sub_reactors_) {
             sub->stop();
         }
@@ -218,15 +300,26 @@ public:
     }
     
     void addConnection(int fd) override {
-        int idx = next_sub_++ % sub_count_;
-        sub_reactors_[idx]->addConnection(fd);
+        int idx = next_sub_.fetch_add(1) % sub_count_;
+        if (idx < static_cast<int>(sub_reactors_.size())) {
+            sub_reactors_[idx]->addConnection(fd);
+        } else {
+            close(fd);
+        }
     }
     
-    void removeConnection(int fd) override {}
+    void removeConnection(int fd) override {};
     
     void setMessageCallback(typename TcpConnection::MessageCallback cb) {
         for (auto& sub : sub_reactors_) {
             sub->setMessageCallback(cb);
+        }
+    }
+    
+    void wakeup() {
+        if (wakeup_fd_ > 0) {
+            uint64_t one = 1;
+            write(wakeup_fd_, &one, sizeof(one));
         }
     }
     
@@ -241,10 +334,10 @@ public:
 private:
     void EventLoop() {
         std::vector<epoll_event> events(1024);
+        LOG_INFO << "MainReactor event loop started";
         
         while (running_) {
             int n = epoll_wait(epoll_fd_, events.data(), events.size(), 100);
-            
             if (n < 0) {
                 if (errno == EINTR) continue;
                 LOG_ERROR << "MainReactor epoll_wait failed: " << strerror(errno);
@@ -252,7 +345,13 @@ private:
             }
             
             for (int i = 0; i < n; ++i) {
-                if (events[i].data.fd == listen_fd_) {
+                int fd = events[i].data.fd;
+                if (fd == wakeup_fd_) {
+                    uint64_t dummy;
+                    read(wakeup_fd_, &dummy, sizeof(dummy));
+                    continue;
+                }
+                if (fd == listen_fd_) {
                     while (true) {
                         sockaddr_in client_addr;
                         socklen_t len = sizeof(client_addr);
@@ -264,18 +363,15 @@ private:
                             }
                             break;
                         }
-                        
                         char client_ip[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
                         LOG_DEBUG << "New connection from " << client_ip 
                                   << ":" << ntohs(client_addr.sin_port);
-                        
                         addConnection(client_fd);
                     }
                 }
             }
         }
-        
         LOG_INFO << "MainReactor event loop stopped";
     }
     
@@ -283,9 +379,10 @@ private:
     uint16_t port_;
     int listen_fd_;
     int epoll_fd_;
+    int wakeup_fd_;
     int sub_count_;
     std::atomic<bool> running_;
     std::atomic<int> next_sub_;
     ThreadPool* thread_pool_;
-    std::vector<std::unique_ptr<SubReactor>> sub_reactors_;
+    std::vector<std::shared_ptr<SubReactor>> sub_reactors_;
 };

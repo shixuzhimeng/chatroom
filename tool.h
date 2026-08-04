@@ -30,7 +30,7 @@ public:
         std::stringstream ss(str);
         std::string sp;
         while(std::getline(ss, sp, delimiter)) {
-            if(sp.empty()) {
+            if(!sp.empty()) {
                 sps.push_back(sp);
             }
         }
@@ -52,11 +52,11 @@ public:
     
     // 检查前缀和后缀
     static bool startWith(const std::string& str, const std::string& str2) {
-        return str.size() >= str2.size() && str.compare(0, str2.size(), str2);
+        return str.size() >= str2.size() && str.compare(0, str2.size(), str2) == 0;
     }
 
     static bool startEnd(const std::string& str, const std::string& str2) {
-        return str.size() >= str2.size() && str.compare(str.size() - str2.size(), str2.size(), str2);
+        return str.size() >= str2.size() && str.compare(str.size() - str2.size(), str2.size(), str2) == 0;
     }
 
     // 时间
