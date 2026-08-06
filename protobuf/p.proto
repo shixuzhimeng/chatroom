@@ -16,6 +16,22 @@ enum MessageType {
     MSG_GROUP_LEAVE = 10;
     MSG_REGISTER = 11;
     MSG_VERIFICATION_CODE = 12;
+    MSG_ADD_FRIEND = 13;
+    MSG_PROCESS_FRIEND_REQUEST = 14;
+    MSG_FRIEND_LIST = 15;
+    MSG_DELETE_FRIEND = 16;
+    MSG_BLOCK_USER = 17;
+    MSG_UNBLOCK_USER = 18;
+    MSG_BLOCK_LIST = 19;
+    MSG_FRIEND_ONLINE_STATUS = 20;
+    MSG_GROUP_DISMISS = 21;
+    MSG_GROUP_LIST = 22;
+    MSG_GROUP_MEMBERS = 23;
+    MSG_SET_ADMIN = 24;
+    MSG_KICK_MEMBER = 25;
+    MSG_PENDING_REQUESTS = 26;
+    MSG_PROCESS_REQUEST = 27;
+    MSG_GROUP_NOTIFICATION = 28;
 }
 
 message MessageHeader {
@@ -114,4 +130,194 @@ message CodeRequest {
 message CodeResponse {
     string code = 1;
     int32 expire_seconds = 2;
+}
+
+message FriendRequestMsg {
+    uint64 to_uid = 1;
+    string message = 2;
+}
+
+// 处理好友请求
+message ProcessFriendRequest {
+    uint64 request_id = 1;
+    bool accept = 2;
+}
+
+// 好友列表响应
+message FriendListResponse {
+    message FriendInfo {
+        uint64 user_id = 1;
+        string username = 2;
+        string nickname = 3;
+        string avatar = 4;
+        int32 status = 5;
+        bool is_online = 6;
+    }
+    repeated FriendInfo friends = 1;
+}
+
+// 删除好友请求
+message DeleteFriendRequest {
+    uint64 friend_id = 1;
+}
+
+// 屏蔽用户请求
+message BlockUserRequest {
+    uint64 block_id = 1;
+}
+
+// 取消屏蔽请求
+message UnblockUserRequest {
+    uint64 block_id = 1;
+}
+
+// 屏蔽列表响应
+message BlockListResponse {
+    repeated uint64 block_ids = 1;
+}
+
+// 在线状态通知
+message OnlineStatusNotification {
+    uint64 user_id = 1;
+    bool online = 2;
+}
+
+// 群组信息
+message GroupInfo {
+    uint64 group_id = 1;
+    string group_name = 2;
+    string group_avatar = 3;
+    uint64 owner_id = 4;
+    string owner_name = 5;
+    string description = 6;
+    int32 member_count = 7;
+    bool is_public = 8;
+    int32 join_type = 9;
+}
+
+// 成员信息
+message GroupMemberInfo {
+    uint64 user_id = 1;
+    string username = 2;
+    string nickname = 3;
+    int32 role = 4;
+    bool is_muted = 5;
+    int64 join_time = 6;
+}
+
+// 申请信息
+message JoinRequestInfo {
+    uint64 request_id = 1;
+    uint64 from_uid = 2;
+    string from_username = 3;
+    string message = 4;
+    int64 created_at = 5;
+}
+
+// 创建群组请求
+message CreateGroupRequest {
+    string group_name = 1;
+    string group_avatar = 2;
+    string description = 3;
+    string announcement = 4;
+    int32 max_members = 5;
+    bool is_public = 6;
+    int32 join_type = 7;
+}
+
+// 创建群组响应
+message CreateGroupResponse {
+    bool success = 1;
+    uint64 group_id = 2;
+    string message = 3;
+}
+
+// 解散群组请求
+message DismissGroupRequest {
+    uint64 group_id = 1;
+}
+
+// 加入群组请求
+message JoinGroupRequest {
+    uint64 group_id = 1;
+    string message = 2;
+}
+
+// 退出群组请求
+message LeaveGroupRequest {
+    uint64 group_id = 1;
+}
+
+// 设置管理员请求
+message SetAdminRequest {
+    uint64 group_id = 1;
+    uint64 target_uid = 2;
+    bool is_admin = 3;
+}
+
+// 踢人请求
+message KickMemberRequest {
+    uint64 group_id = 1;
+    uint64 target_uid = 2;
+}
+
+// 处理入群申请请求
+message ProcessJoinRequest {
+    uint64 request_id = 1;
+    bool accept = 2;
+}
+
+// 获取群组列表请求
+message GetGroupListRequest {
+    // 无参数
+}
+
+// 群组列表响应
+message GroupListResponse {
+    bool success = 1;
+    string message = 2;
+    repeated GroupInfo groups = 3;
+}
+
+// 获取群成员请求
+message GetGroupMembersRequest {
+    uint64 group_id = 1;
+}
+
+// 群成员列表响应
+message GroupMembersResponse {
+    bool success = 1;
+    string message = 2;
+    uint64 group_id = 3;
+    repeated GroupMemberInfo members = 4;
+}
+
+// 获取待处理申请请求
+message GetPendingRequestsRequest {
+    uint64 group_id = 1;
+}
+
+// 待处理申请响应
+message PendingRequestsResponse {
+    bool success = 1;
+    string message = 2;
+    repeated JoinRequestInfo requests = 3;
+}
+
+// 群组通知
+message GroupNotification {
+    enum NotificationType {
+        NOTIFY_NEW_MEMBER = 0;
+        NOTIFY_MEMBER_LEFT = 1;
+        NOTIFY_GROUP_DISMISSED = 2;
+        NOTIFY_JOIN_REQUEST = 3;
+        NOTIFY_REQUEST_ACCEPTED = 4;
+        NOTIFY_REQUEST_REJECTED = 5;
+        NOTIFY_ROLE_CHANGED = 6;
+        NOTIFY_KICKED = 7;
+    }
+    NotificationType type = 1;
+    uint64 group_id = 2;
+    uint64 user_id = 3;
+    string message = 4;
 }

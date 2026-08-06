@@ -49,42 +49,34 @@ public:
     // 解码
     static bool decode(vector<char>& data, size_t& consumed, p::MessageHeader& header, vector<char>& body) {
         consumed = 0;
-
-        if(data.size() < sizeof(uint32_t)) {
-            return false;
-        }
+        if (data.size() < sizeof(uint32_t)) return false;
+        
         uint32_t total_len;
         memcpy(&total_len, data.data(), sizeof(uint32_t));
-
-        if(data.size() < sizeof(uint32_t) + total_len) {
-            return false;
-        }
-
+        total_len = ntohl(total_len);
+        
+        if (data.size() < sizeof(uint32_t) + total_len) return false;
+        
         size_t pos = sizeof(uint32_t);
-
-        // 读取header
-        if(!header.ParseFromArray(data.data() + pos, 1024)) {
+        
+        // 解析 header
+        if (!header.ParseFromArray(data.data() + pos, total_len)) {
             LOG_ERROR << "header parse failed";
             return false;
         }
-
-        // 计算header的值
-        std::string header_str;
-        header.SerializeToString(&header_str);
-        size_t header_len = header_str.size();
+        
+        // 获取 header 实际序列化长度
+        size_t header_len = header.ByteSizeLong();
         pos += header_len;
-
-        // 读取body
+        
         uint32_t body_len = header.body_length();
-        if(body_len > 0 && body_len <= total_len - header_len) {
+        if (body_len > 0 && body_len <= total_len - header_len) {
             body.assign(data.data() + pos, data.data() + pos + body_len);
             pos += body_len;
         }
-
+        
         consumed = pos;
-
-
-        LOG_ERROR << "type : " << header.msg_type() << "body_len :" << body_len << "consumed :" << consumed << std::endl;
+        LOG_DEBUG << "type: " << header.msg_type() << ", body_len: " << body_len << ", consumed: " << consumed;
         return true;
     }
 };
