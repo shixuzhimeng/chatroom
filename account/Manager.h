@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 
 class TManager {
@@ -18,7 +19,6 @@ public:
         return instance;
     }
 
-    TManager() = default;
 
     struct TInfo {
         uint64_t user_id;
@@ -53,7 +53,7 @@ public:
         
         auto it = Tcache_.find(tID);
         if(it == Tcache_.end()) {
-            LOG_ERROR << "Not found tID: " << tID.substr(0, 0) << "...";
+            LOG_ERROR << "Not found tID: " << tID.substr(0, 8) << "...";
             return false;
         }
 
@@ -78,7 +78,7 @@ public:
         
         it->second.expire_time = std::chrono::steady_clock::now() + std::chrono::hours(extra_hours);
 
-        LOG_ERROR << "tID refreshed";
+        LOG_INFO << "tID refreshed";
         return true;
     }
 
@@ -95,14 +95,14 @@ public:
 
         auto ut_it = user_t_.find(user_id);
         if(ut_it != user_t_.end()) {
-            auto& tID = ut_it->second;
-            tID.erase(std::remove(tID.begin(), tID.end(), tID), tID.end());
-            if(tID.empty()) {
+            auto& tlist = ut_it->second;
+            tlist.erase(std::remove(tlist.begin(), tlist.end(), tID), tlist.end());
+            if(tlist.empty()) {
                 user_t_.erase(ut_it);
             }
         }
 
-        LOG_ERROR << "tID revoke for user_id: " << user_id;
+        LOG_INFO << "tID revoke for user_id: " << user_id;
         return true;
     }
 
@@ -110,13 +110,25 @@ public:
     void revokeAlltID(uint64_t user_id) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = user_t_.find(user_id);
-        if(it == user_t_.end()) {
+        if(it != user_t_.end()) {
             for(const auto& tID : it->second) {
                 Tcache_.erase(tID);
             }
             user_t_.erase(it);
             LOG_INFO << "All tID revoked for user_id" << user_id;
         }
+    }
+
+    // 获取当前用户的所有的有效的临时身份ID
+    std::vector<std::string> getUserT(uint64_t user_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+    
+        auto it = user_t_.find(user_id);
+        if(it != user_t_.end()) {
+            return it->second;
+        }
+
+        return {};
     }
 
     //清理过期的身份ID
@@ -135,9 +147,8 @@ public:
         for(const auto& tID : to_remove) {
             Tcache_.erase(tID);
             for(auto& pair : user_t_) {
-                auto uid = pair.first;
-                auto tID = pair.second;
-                tID.erase(std::remove(tID.begin(), tID.end(), tID), tID.end());
+                auto& tlist = pair.second;
+                tlist.erase(std::remove(tlist.begin(), tlist.end(), tID), tlist.end());
             }
         }
 
@@ -153,6 +164,8 @@ public:
     }
 
 private:
+    TManager() = default;
+
     std::mutex mutex_;
     std::unordered_map<std::string, TInfo> Tcache_;
     std::unordered_map<uint64_t, std::vector<std::string>> user_t_;    

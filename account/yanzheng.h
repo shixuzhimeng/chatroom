@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
+#include <string>
 
 
 class YanZheng {

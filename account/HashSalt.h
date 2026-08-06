@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
-
+#include <stdexcept>
 
 class Crypot {
 public:
@@ -15,7 +15,7 @@ public:
     // 生成随机盐值
     static std::string generateSalt(size_t length = 16) {
         std::vector<unsigned char> salt(length);
-        if(RAND_bytes(salt.data(), length)) {
+        if(RAND_bytes(salt.data(), length) != 1) {
             throw std::runtime_error("failed to generate salt");
         }
         return bytesToHex(salt.data(),length);
