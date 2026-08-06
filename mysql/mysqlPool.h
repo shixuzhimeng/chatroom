@@ -92,7 +92,6 @@ public:
         
         // 创建预连接
         try {
-            auto conn = createConnection();
             for(int i = 0; i < min; i++) {
                 auto conn = createConnection();
 
@@ -246,7 +245,7 @@ public:
     bool connect() { 
         try {
             conn_ = ConnectionPool::getInstance().getConnection();
-            return false;
+            return true;
         }
         catch(const std::exception& e) {
             LOG_ERROR << "connect failed : " << e.what();

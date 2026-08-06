@@ -12,6 +12,21 @@ class BaseDAO {
 public:
     virtual ~BaseDAO() = default;
 
+    // 事务
+    bool beginTransaction() {
+        return executeUpdate("START TRANSACTION");
+    }
+    
+    bool commitTransaction() {
+        return executeUpdate("COMMIT");
+    }
+    
+    bool rollbackTransaction() {
+        return executeUpdate("ROLLBACK");
+    }
+
+
+
 protected:
     // 查询操作
     bool executeQuery(const std::string& sql, std::vector<std::map<std::string, std::string>>& result) {
@@ -63,7 +78,7 @@ protected:
             LOG_ERROR << "Update failed:" << mysql_errno(conn.get()) << "SQL:" << sql;
             return false;
         }
-        return false;
+        return true;
     }
 
     // 获取新插入的ID
@@ -71,7 +86,7 @@ protected:
         putbackConnection conn;
         if(!conn.connect()) {
             LOG_ERROR << "Database connection failed";
-            return false;
+            return 0;
         }
 
         return mysql_insert_id(conn.get());
@@ -83,26 +98,22 @@ protected:
         if(!conn.connect()) {
             return str;
         }
-
-        char* escaped = new char[str.length()* 2 + 1];
-        mysql_real_escape_string(conn.get(), escaped, str.c_str(), str.length());
-        std::string result(escaped);
-        delete[] escaped;
-        return result;
+        std::vector<char> escaped(str.length() * 2 + 1);
+        mysql_real_escape_string(conn.get(), escaped.data(), str.c_str(), str.length());
+        return std::string(escaped.data());
     }
-
     // 将数据转换为SQL语句
     std::string bulidSentence(const std::map<std::string, std::string>& conditions) {
         if(conditions.empty()) {
             return "";
         }
-        std::string where = "WHERE";
+        std::string where = " WHERE ";
         bool first = true;
         for (const auto& pair : conditions) {
             const auto& key = pair.first;
             const auto& value = pair.second;
             if(!first) {
-                where += "AND";
+                where += " AND ";
             }
             where += key + " = '" + escapeString(value) + "'";
             first = false;
