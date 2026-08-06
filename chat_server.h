@@ -13,6 +13,7 @@
 #include "friend/FriendHandle.h"
 #include "friend/OnlineManager.h"
 #include <chrono>
+#include "group/grouphandle.h"
 
 class ChatServer{
 public:
@@ -115,8 +116,7 @@ private:
         });
 
         // 聊天处理
-        dispatcher_.registerHandle(p::MSG_CHAT,
-            [this](auto conn, auto& header, auto& body) {
+        dispatcher_.registerHandle(p::MSG_CHAT,[this](auto conn, auto& header, auto& body) {
                 handleChat(conn, header, body);
             });
 
@@ -165,6 +165,55 @@ private:
         dispatcher_.registerHandle(p::MSG_BLOCK_LIST,
             [this](auto conn, auto& header, auto& body) {
                 friend_handler_.handleGetBlockList(conn, header, body);
+            });
+            dispatcher_.registerHandle(p::MSG_GROUP_CREATE,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleCreateGroup(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_GROUP_DISMISS,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleDismissGroup(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_GROUP_JOIN,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleJoinGroup(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_GROUP_LEAVE,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleLeaveGroup(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_GROUP_LIST,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleGetGroupList(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_GROUP_MEMBERS,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleGetGroupMembers(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_SET_ADMIN,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleSetAdmin(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_KICK_MEMBER,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.Kickmember(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_PENDING_REQUESTS,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleGetPendingRequests(conn, header, body);
+            });
+        
+        dispatcher_.registerHandle(p::MSG_PROCESS_REQUEST,
+            [this](auto conn, auto& header, auto& body) {
+                group_handler_.handleProcessJoinRequest(conn, header, body);
             });
         LOG_INFO << "Registered " << dispatcher_.handlesCount() << "message handle"; 
     }
@@ -330,6 +379,7 @@ private:
     proto::Dispatch dispatcher_;
     std::unordered_map<uint64_t, std::shared_ptr<TcpConnection>> user_connections_;
     friendHandle friend_handler_;
+    GroupHandle group_handler_;
     std::thread timeout_thread_;
     std::atomic<bool> running_;
 };
