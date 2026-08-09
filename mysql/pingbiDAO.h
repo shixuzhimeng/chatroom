@@ -3,7 +3,7 @@
 #include "baseDAO.h"
 #include "tool.h"
 
-class BlockDAO : public BaseDAO{
+class BlockDAO : public BaseDAO {
 public:
     // 屏蔽用户
     bool blockUser(uint64_t user_id, uint64_t block_id) {

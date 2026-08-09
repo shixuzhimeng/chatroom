@@ -249,7 +249,7 @@ public:
     }
 
     // 获取离线消息
-    std::vector<Message> getOfflineMessage(uint64_t user_id) {
+    std::vector<Message> getOfflineMessages(uint64_t user_id) {
         std::vector<Message> messages;
         
         // 查询未投递的离线消息
@@ -320,13 +320,110 @@ public:
         return std::stoi(result[0]["count"]);
     }
 
-    // 清理过期的消息(7天前)
+    // 清理过期的离线消息(7天前)
     bool cleanOfflineMessages(int day = 7) {
         int64_t cur_time = tool::getTimestamp() - day * 24 * 3600 * 1000;
         std::string  sql = "DELETE FROM dffline_messages WHERE received_at < " + std::to_string(cur_time); 
         return executeUpdate(sql);
     }
 
+    // 清理过期的消息(一个月前)
+    bool cleanOldMessages(int day = 30) {
+        int64_t cutoff_time = tool::getTimestamp() - day * 24 * 3600 * 1000;
+        std::string sql = "DELETE FROM message WHERE created_at < " + std::to_string(cutoff_time) + " AND status = 4";
+        return executeUpdate(sql); 
+    }
+
+    // 会话列表
+    std::vector<ConversationInfo> getConversationList(uint64_t user_id, int limit = 50) {
+        std::vector<ConversationInfo> conversations;
+
+        // 获取最近的会话
+        std::string sql = "SELECT CASE WHEM from_uid = " + std::to_string(user_id) + " THEN to_uid ELSE from_uid END as other_uid, "
+                          "MAX(msg_id) as last_msg_id, " "MAX(created_at) as last_time "
+                          "FROM messages WHERE (from_uid = " + std::to_string(user_id) + 
+                          " OR to_uid = " + std::to_string(user_id) + ") " "AND chat_type = 1 "
+                          "GROUP BY other_uid "
+                          "ORDER BY last_time DESC LIMIT " + std::to_string(limit);
+        
+        std::vector<std::map<std::string, std::string>> result;
+        if(!executeQuery(sql, result)) {
+            return conversations;
+        }
+
+        for(const auto& row : result) {
+            ConversationInfo info;
+            uint64_t other_uid = std::stoull(row.at("other_uid"));
+            info.user_id = other_uid;
+            info.last_msg_id = std::stoull(row.at("last_msg_id"));
+            info.last_msg_time = std::stoll(row.at("last_msg_time"));
+        
+            // 获取用户的信息
+            std::string user_sql = "SELECT username, nickname, avatar, status FROM users WHERE user_id = " +std::to_string(other_uid);
+            std::vector<std::map<std::string, std::string>> user_result;
+            if(!executeQuery(user_sql, user_result) && !user_result.empty()) {
+                info.username = user_result[0]["username"];
+                info.nickname = user_result[0]["nickname"];
+                info.avatar = user_result[0]["avatar"];
+                info.online_status = std::stoi(user_result[0]["status"]);
+            }
+
+            // 获取最后一条消息内容
+            std::string msg_sql = "SELECT content, msg_type FROM messages WHERE msg_id = " + std::to_string(info.last_msg_id);
+            std::vector<std::map<std::string, std::string>> msg_result;
+            if(!executeQuery(msg_sql, msg_result) && ! msg_result.empty()) {
+                int msg_type = std::stoi(msg_result[0]["msg_type"]);
+                if(msg_type == 1) {
+                    info.last_msg_conten = msg_result[0]["content"];
+                }
+                else {
+                    info.last_msg_conten = "[" +  getMessageTypeName(msg_type) + "]";
+                }
+            }
+
+            // 获取未读的数量
+            info.unread_count = getUnreadCount(user_id, other_uid);
+
+            conversations.push_back(info);
+        }
+
+        return conversations;
+    }
+
+    // 搜索聊天记录
+    std::vector<Message> searchMessage(uint64_t user_id, const std::string& keyword, int limit = 50, int64_t before_time = 0) {
+        std::vector<Message> messages;
+
+        // 查询条件
+        std::string sql = "SELECT * FROM messages WHERE (from_uid = " + std::to_string(user_id) + 
+                          " OR to_uid = " + std::to_string(user_id) + ") "
+                          "AND content LIKE '%" + escapeString(keyword) + "%' ";
+        
+        // 分页参数
+        if(before_time < 0) {
+            sql += " AND cerated_at < " + std::to_string(before_time);
+        }
+
+        // 排序
+        sql += " ORDER BY created_at DESC LIMIT " + std::to_string(limit);\
+
+        // 执行查询
+        std::vector<std::map<std::string, std::string>> result;
+        if(!executeQuery(sql, result)) {
+            return messages;
+        }
+
+        // 填充结果
+        for(const auto& row : result) {
+            Message msg;
+            fillMessageFromMap(row, msg);
+            messages.push_back(msg);
+        }
+
+        // 升序
+        std::reverse(messages.begin(), messages.end());
+        return messages;
+    }
 
 private:
     void fillMessageFromMap(const std::map<std::string, std::string>& row, Message& msg) {
@@ -342,5 +439,22 @@ private:
         msg.created_at = std::stoll(row.at("created_at"));
         msg.delivered_at = std::stoll(row.at("delivered_at"));
         msg.read_at = std::stoll(row.at("read_at"));
+    }
+
+    std::string getMessageTypeName(int type) {
+        switch(type) {
+            case 2:
+                return "图片";
+            case 3:
+                return "文件";
+            case 4:
+                return "语音";
+            case 5:
+                return "视频";
+            case 6:
+                return "系统消息";
+            default:
+                return "未知";
+        }
     }
 };

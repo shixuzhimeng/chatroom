@@ -262,7 +262,7 @@ public:
     // 查询成员列表
     std::vector<GroupMember> getGroupMembers(uint64_t group_id) {
         std::vector<GroupMember> members;
-        std::string sql = "SELECT gm.*, u.username, u.avatar FROM group_members gm "
+        std::string sql = "SELECT gm.*, u.username FROM group_members gm "
                           "LEFT JOIN users u ON gm.user_id = u.user_id "
                           "WHERE gm.group_id = " + std::to_string(group_id) + " "
                           "ORDER BY gm.role DESC, gm.join_time ASC";
