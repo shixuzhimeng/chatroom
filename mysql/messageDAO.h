@@ -8,6 +8,8 @@
 #include <map>
 #include <queue>
 #include <deque>
+#include "protobuf/mysql_p.h"
+
 
 // 在线消息
 struct Message {
@@ -17,7 +19,7 @@ struct Message {
     int chat_type = 1;  // 1.私聊  2.群聊
     int msg_type = 1;   // 1.文本  2.图片  3.文件  4.语音  5.视频  6.系统消息
     std::string content;
-    std::string extra;
+    std::string extra;  // 存储序列化的MessageExtra
     int status = 0;     // 0.已经发送  1.已经送达  2.已读  3.撤回  4.已删除
     bool is_recalled = false;
     int64_t recalled_at = 0;
@@ -44,7 +46,7 @@ struct ConversationInfo {
     std::string nickname;
     std::string avatar;
     uint64_t last_msg_id = 0;
-    std::string last_msg_conten;
+    std::string last_msg_content;
     int64_t last_msg_time = 0;
     int unread_count = 0;
     int online_status = 0;  // 0.离线  1.在线  2.忙碌  3.离开
@@ -54,6 +56,7 @@ class MessageDAO : public BaseDAO {
 public:
     // 消息存储
     bool saveMessage(const Message& msg, uint64_t& msg_id) {
+        std::string extra_json = msg.extra.empty() ? "{}" : msg.extra;
         std::string sql = "INSERT INTO messages (from_uid, to_uid, chat_type, msg_type, content, extra, "
                           "status, is_recalled, created_at, delivered_at, read_at) VALUES (";
 
@@ -62,7 +65,7 @@ public:
         sql += std::to_string(msg.chat_type) + ", ";
         sql += std::to_string(msg.msg_type) + ", '";
         sql += escapeString(msg.content) + "', '";
-        sql += escapeString(msg.extra) + "', ";
+        sql += escapeString(extra_json) + "', ";
         sql += std::to_string(msg.status) + ", ";
         sql += std::to_string(msg.is_recalled ? 1 : 0) + ", ";
         sql += std::to_string(msg.created_at) + ", ";
@@ -78,6 +81,35 @@ public:
         LOG_DEBUG << "Message saved: " << msg_id << " from " << msg.from_uid << " to " << msg.to_uid;
 
         return true;
+    }
+
+    // 使用Protobuf存储
+    bool saveMessage(const Message& msg, const db::MessageExtra& extra, uint64_t& msg_id) {
+        Message msg_copy = msg;
+        msg_copy.extra = Switch::sToJson(extra);
+        return saveMessage(msg_copy, msg_id);
+    }
+
+    // 获取消息并解析为Protobuf
+    bool getMessageById(uint64_t msg_id, Message& msg, db::MessageExtra& extra) {
+        if (!getMessageByID(msg_id, msg)) {
+            return false;
+        }
+        return Switch::dsFromJson(msg.extra, extra);
+    }
+
+    // 获取历史消息并解析extra
+    std::vector<std::pair<Message, db::MessageExtra>> getChatHistoryWithExtra(
+        uint64_t user1_id, uint64_t user2_id, int limit = 100) {
+        std::vector<std::pair<Message, db::MessageExtra>> results;
+        auto messages = getChatHistory(user1_id, user2_id, limit);
+        
+        for (const auto& msg : messages) {
+            db::MessageExtra extra;
+            Switch::dsFromJson(msg.extra, extra);
+            results.push_back({msg, extra});
+        }
+        return results;
     }
 
     // 根据消息ID获取消息
@@ -123,7 +155,7 @@ public:
     }
 
     // 查询历史消息（较早的消息）
-    std::vector<Message> getCharHistoryAfter(uint64_t user1_id, uint64_t user2_id, int64_t after_time, int limit = 100) {
+    std::vector<Message> getChatHistoryAfter(uint64_t user1_id, uint64_t user2_id, int64_t after_time, int limit = 100) {
         std::vector<Message> messages;
 
         std::string sql = "SELECT * FROM messages WHERE chat_type = 1 AND ("
@@ -161,7 +193,7 @@ public:
 
     // 标记所有的消息为已送达
     bool markmessageAsdelivered(uint64_t to_uid, uint64_t from_uid) {
-        std::string sql = "UPDATE messages SET status = 1. delivered_at = " + std::to_string(tool::getTimestamp());
+        std::string sql = "UPDATE messages SET status = 1, delivered_at = " + std::to_string(tool::getTimestamp());
                           " WHERE to_uid = " + std::to_string(to_uid);
                           " AND from_uid = " + std::to_string(from_uid);
                           " AND status = 0";
@@ -180,7 +212,7 @@ public:
 
     // 标记所有的信息为已读
     bool markAllMessagesAsRead(uint64_t to_uid) {
-        std::string sql = "UPDATE messages SET status = 2. read_at = " + std::to_string(tool::getTimestamp());
+        std::string sql = "UPDATE messages SET status = 2, read_at = " + std::to_string(tool::getTimestamp());
                           " WHERE to_uid = " + std::to_string(to_uid) + 
                           " AND status IN (0, 1)";
 
@@ -218,7 +250,7 @@ public:
         std::map<uint64_t, int> result_map;
 
         // 分组聚合查询
-        std::string sql = "SELECT from_uid, COUNT(*) as count FROM message "
+        std::string sql = "SELECT from_uid, COUNT(*) as count FROM messages "
                           "WHERE to_uid = " + std::to_string(to_uid) + 
                           " AND status IN (0, 1) GROUP BY from_uid";
 
@@ -323,14 +355,14 @@ public:
     // 清理过期的离线消息(7天前)
     bool cleanOfflineMessages(int day = 7) {
         int64_t cur_time = tool::getTimestamp() - day * 24 * 3600 * 1000;
-        std::string  sql = "DELETE FROM dffline_messages WHERE received_at < " + std::to_string(cur_time); 
+        std::string  sql = "DELETE FROM offline_messages WHERE received_at < " + std::to_string(cur_time); 
         return executeUpdate(sql);
     }
 
     // 清理过期的消息(一个月前)
     bool cleanOldMessages(int day = 30) {
         int64_t cutoff_time = tool::getTimestamp() - day * 24 * 3600 * 1000;
-        std::string sql = "DELETE FROM message WHERE created_at < " + std::to_string(cutoff_time) + " AND status = 4";
+        std::string sql = "DELETE FROM messages WHERE created_at < " + std::to_string(cutoff_time) + " AND status = 4";
         return executeUpdate(sql); 
     }
 
@@ -339,7 +371,7 @@ public:
         std::vector<ConversationInfo> conversations;
 
         // 获取最近的会话
-        std::string sql = "SELECT CASE WHEM from_uid = " + std::to_string(user_id) + " THEN to_uid ELSE from_uid END as other_uid, "
+        std::string sql = "SELECT CASE WHEN from_uid = " + std::to_string(user_id) + " THEN to_uid ELSE from_uid END as other_uid, "
                           "MAX(msg_id) as last_msg_id, " "MAX(created_at) as last_time "
                           "FROM messages WHERE (from_uid = " + std::to_string(user_id) + 
                           " OR to_uid = " + std::to_string(user_id) + ") " "AND chat_type = 1 "
@@ -361,7 +393,7 @@ public:
             // 获取用户的信息
             std::string user_sql = "SELECT username, nickname, avatar, status FROM users WHERE user_id = " +std::to_string(other_uid);
             std::vector<std::map<std::string, std::string>> user_result;
-            if(!executeQuery(user_sql, user_result) && !user_result.empty()) {
+            if(executeQuery(user_sql, user_result) && !user_result.empty()) {
                 info.username = user_result[0]["username"];
                 info.nickname = user_result[0]["nickname"];
                 info.avatar = user_result[0]["avatar"];
@@ -374,10 +406,10 @@ public:
             if(!executeQuery(msg_sql, msg_result) && ! msg_result.empty()) {
                 int msg_type = std::stoi(msg_result[0]["msg_type"]);
                 if(msg_type == 1) {
-                    info.last_msg_conten = msg_result[0]["content"];
+                    info.last_msg_content = msg_result[0]["content"];
                 }
                 else {
-                    info.last_msg_conten = "[" +  getMessageTypeName(msg_type) + "]";
+                    info.last_msg_content = "[" +  getMessageTypeName(msg_type) + "]";
                 }
             }
 
@@ -400,8 +432,8 @@ public:
                           "AND content LIKE '%" + escapeString(keyword) + "%' ";
         
         // 分页参数
-        if(before_time < 0) {
-            sql += " AND cerated_at < " + std::to_string(before_time);
+        if(before_time > 0) {
+            sql += " AND created_at < " + std::to_string(before_time);
         }
 
         // 排序
@@ -430,7 +462,7 @@ private:
         msg.msg_id = std::stoull(row.at("msg_id"));
         msg.msg_type = std::stoi(row.at("msg_type"));
         msg.from_uid = std::stoull(row.at("from_uid"));
-        msg.to_uid = std::stoull(row.at("to_usd"));
+        msg.to_uid = std::stoull(row.at("to_uid"));
         msg.chat_type = std::stoi(row.at("chat_type"));
         msg.content = row.at("content");
         msg.extra = row.at("extra");

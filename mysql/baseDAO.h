@@ -7,6 +7,8 @@
 #include <vector>
 #include <map>
 #include <functional>
+#include "protobuf/mysql_p.h"
+#include <nlohmann/json.hpp>
 
 class BaseDAO {
 public:
@@ -38,7 +40,7 @@ protected:
         
         // 查询
         if(mysql_query(conn.get(), sql.c_str())) {
-            LOG_ERROR << "Query failed: " << mysql_errno(conn.get()) << "SQL:" << sql;
+            LOG_ERROR << "Query failed: " << mysql_error(conn.get()) << "SQL:" << sql;
             return false;
         }
         
@@ -119,5 +121,52 @@ protected:
             first = false;
         }
         return where;
+    }
+
+    template<typename T>
+    std::string sExtra(const T& message) {
+        return Switch::sToJson(message);
+    }
+    
+    template<typename T>
+    bool dsExtra(const std::string& json_str, T& message) {
+        return Switch::dsFromJson(json_str, message);
+    }
+
+    // 将字段值转换为JSON
+    std::string toJsonString(const std::map<std::string, std::string>& data) {
+        std::string json = "{";
+        bool first = true;
+        for (const auto& [key, value] : data) {
+            if (!first) json += ",";
+            json += "\"" + key + "\":\"" + escapeString(value) + "\"";
+            first = false;
+        }
+        json += "}";
+        return json;
+    }
+    
+    // 从JSON解析字段值
+    std::map<std::string, std::string> fromJsonString(const std::string& json_str) {
+        std::map<std::string, std::string> result;
+        // 简单解析（实际应使用JSON库）
+        if (json_str.empty() || json_str == "{}") {
+            return result;
+        }
+        
+        // 使用nlohmann/json解析
+        try {
+            auto json = nlohmann::json::parse(json_str);
+            for (auto& [key, value] : json.items()) {
+                if (value.is_string()) {
+                    result[key] = value.get<std::string>();
+                } else {
+                    result[key] = value.dump();
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR << "Parse JSON failed: " << e.what();
+        }
+        return result;
     }
 };

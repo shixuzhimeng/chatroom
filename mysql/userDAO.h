@@ -4,6 +4,7 @@
 #include <vector>
 #include "baseDAO.h"
 #include "../tool.h"
+#include "protobuf/mysql_p.h"
 
 
 struct USER{
@@ -18,6 +19,7 @@ struct USER{
     int status = 0;
     int64_t created_at = 0;
     int64_t updated_at = 0;
+    std::string settings;  // 存储序列化的UserSetting
 };
 
 
@@ -25,8 +27,10 @@ struct USER{
 class UserDAO : public BaseDAO{
 public:
     bool createUser(const USER& user, uint64_t& user_id) {
+        // 序列化设置
+        std::string settings_json = user.settings.empty() ? "{}" : user.settings;
         std::string sql = "INSERT INTO users(username, password_hash, salt, email, phone, "
-                          "nickname, avatar, status, created_at, updated_at) VALUES ('";
+                          "nickname, avatar, status, settings, created_at, updated_at) VALUES ('";
         sql += escapeString(user.username) + "', '";
         sql += escapeString(user.password_hash) + "', '";
         sql += escapeString(user.salt) + "', '";
@@ -34,7 +38,8 @@ public:
         sql += escapeString(user.phone) + "', '";
         sql += escapeString(user.nickname) + "', '";
         sql += escapeString(user.avatar) + "', ";
-        sql += std::to_string(user.status) + ", ";
+        sql += std::to_string(user.status) + ", '";
+        sql += escapeString(settings_json) + "', ";
         sql += std::to_string(user.created_at) + ", ";
         sql += std::to_string(user.updated_at) + ")";
         
@@ -47,7 +52,7 @@ public:
     }
 
     bool getUserByID(uint64_t user_id, USER& user) {
-        std::string sql = "SELECT * FROM users WHERE user_id = '" + std::to_string(user_id) + "'";
+        std::string sql = "SELECT * FROM users WHERE user_id = " + std::to_string(user_id);
         std::vector<std::map<std::string, std::string>> result;
         
         if(!executeQuery(sql, result) || result.empty()) {
@@ -84,6 +89,28 @@ public:
     bool updateUserStatus(uint64_t user_id, int status) {
         std::string sql = "UPDATE users SET status = " + std::to_string(status) + ", updated_at = " + std::to_string(tool::getTimestamp()) + " WHERE user_id = " + std::to_string(user_id);
         return executeUpdate(sql);
+    }
+
+    bool updateUserSettings(uint64_t user_id, const std::string& settings_json) {
+        std::string sql = "UPDATE users SET settings = '" + escapeString(settings_json) +
+                          "', updated_at = " + std::to_string(tool::getTimestamp()) +
+                          " WHERE user_id = " + std::to_string(user_id);
+        return executeUpdate(sql);
+    }
+    
+    // 使用Protobuf更新用户设置
+    bool updateUserSettings(uint64_t user_id, const db::UserSettings& settings) {
+        std::string json = Switch::sToJson(settings);
+        return updateUserSettings(user_id, json);
+    }
+    
+    // 获取用户设置（Protobuf格式）
+    bool getUserSettings(uint64_t user_id, db::UserSettings& settings) {
+        USER user;
+        if (!getUserByID(user_id, user)) {
+            return false;
+        }
+        return Switch::dsFromJson(user.settings, settings);
     }
 
     bool updateUserInfo(const USER& user) {
@@ -133,5 +160,6 @@ private:
         user.avatar = row.at("avatar");
         user.created_at = std::stoll(row.at("created_at"));
         user.updated_at = std::stoll(row.at("updated_at"));
+        user.settings = row.at("settings");
     }
 };
