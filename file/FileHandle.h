@@ -37,7 +37,7 @@ public:
         manage_.stopCleaner();
     }
 
-    void setUserConnection(std::unordered_map<uint64_t, std::shared_ptr<TcpConnection>>* conn) {
+    void setUserConnections(std::unordered_map<uint64_t, std::shared_ptr<TcpConnection>>* conn) {
         user_connection_ = conn;
     }
 
@@ -102,6 +102,11 @@ public:
                 if(manage_.copyFile(existing_file_id, file_id)) {
                     dao.insertFile(new_record);
                     sendFileMessage(new_record, header);
+                }
+                else {
+                    LOG_ERROR << "Failed to copy file for deduplication: " << existing_file_id;
+                    sendFileResponse(conn, header, false, "File copy failed");
+                    return;
                 }
                 return ;
             }
@@ -190,7 +195,7 @@ public:
         // 验证会话
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         auto it = upload_sessions_.find(file_id);
-        if(it != upload_sessions_.end()) {
+        if(it == upload_sessions_.end()) {
             LOG_ERROR << "No upload session file: " << file_id;
             return ;
         }
@@ -211,7 +216,7 @@ public:
             std::string expected_md5;
             FileDAO dao;
             FileRecord record;
-            if(!dao.getFileByID(file_id, record)) {
+            if(dao.getFileByID(file_id, record)) {
                 expected_md5 = record.md5;
             }
 
@@ -266,6 +271,149 @@ public:
         }
     }
 
+    // 文件的下载请求
+    void handleFileDownloadReq(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        db::FileDownloadReq req;
+        if(!req.ParseFromArray(body.data(), body.size())) {
+            sendFileResponse(conn, header, false, "Invalid request");
+            return ;
+        }
+
+        uint64_t user_id = conn->getUserID();
+        if(user_id == 0) {
+            sendFileResponse(conn, header, false, "User not logged in");
+            return ;
+        }
+
+        std::string file_id = req.file_id();
+        uint64_t offset = req.offset();
+
+        FileDAO dao;
+        FileRecord record;
+        if(!dao.getFileByID(file_id, record)) {
+            sendFileResponse(conn, header, false, "File not found");
+            return ;
+        }
+
+        // 验证只有接收方可以下载
+        if(record.to_uid != user_id) {
+            sendFileResponse(conn, header, false, "Permission denied");
+            return ;
+        }
+
+        // 检查文件是否存在
+        uint64_t file_size = manage_.getFileSize(file_id);
+        if(file_size == 0) {
+            sendFileResponse(conn, header, false, "File data missing");
+            return ;
+        }
+
+        // 创建下载会话
+        FileSession session;
+        session.file_id = file_id;
+        session.from_uid = record.from_uid;
+        session.to_uid = user_id;
+        session.total_size = file_size;
+        session.download_size = offset;
+        session.direction = 1;
+        session.last_active = std::chrono::steady_clock::now();
+        session.is_offline = record.is_offline;
+    
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            download_sessions_[file_id] = session;
+        }
+
+        // 响应
+        db::FileDownloadResp resp;
+        resp.set_success(true);
+        resp.set_file_id(file_id);
+        resp.set_file_size(file_size);
+        resp.set_filename(record.filename);
+        resp.set_offset(offset);
+        resp.set_message("Download ready");
+        resp.set_md5(record.md5);
+        resp.set_is_offline(record.is_offline);
+
+        p::MessageHeader resp_header;
+        resp_header.set_msg_id(header.msg_id() + 1);
+        resp_header.set_msg_type(p::MSG_FILE_DOWNLOAD_RESP);
+        resp_header.set_timestamp(tool::getTimestamp());
+
+        auto data = proto::MessageCodec::encode(resp_header, resp);
+        if(!data.empty()) {
+            conn->send(data.data(), data.size());
+        }
+
+        // 标记离线文件已下载
+        if(record.is_offline) {
+            dao.markOfflineFileDownLoaded(file_id, user_id);
+        }
+
+        // 开始传输文件块
+        sendNextChunk(conn, file_id, offset);
+
+        LOG_INFO << "File download started: " << file_id << " for user " << user_id << ", offset: " << offset;
+    }
+
+    // 发送文件块
+    void sendNextChunk(std::shared_ptr<TcpConnection> conn, const std::string& file_id, uint64_t offset) {
+        const uint32_t CHUNK_SIZE = 64 * 1024;
+
+        while (true) {
+            if (!conn || conn->isClosed()) {
+                LOG_ERROR << "Connection closed during download: " << file_id;
+                break;
+            }
+
+            std::string chunk_data;
+            if (!manage_.readChunk(file_id, offset, CHUNK_SIZE, chunk_data)) {
+                LOG_ERROR << "Read chunk failed at offset " << offset;
+                break;
+            }
+            if (chunk_data.empty()) break;
+
+            uint32_t chunk_index = offset / CHUNK_SIZE;
+
+            db::FileDownloadChunk chunk;
+            chunk.set_file_id(file_id);
+            chunk.set_chunk_index(chunk_index);
+            chunk.set_offset(offset);
+            chunk.set_data(chunk_data);
+            chunk.set_is_last(chunk_data.size() < CHUNK_SIZE);
+
+            p::MessageHeader header;
+            header.set_msg_type(p::MSG_FILE_DOWNLOAD_CHUNK);
+            header.set_timestamp(tool::getTimestamp());
+
+            auto msg_data = proto::MessageCodec::encode(header, chunk);
+            if (!msg_data.empty()) {
+                conn->send(msg_data.data(), msg_data.size());
+            }
+
+            // 更新会话
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                auto it = download_sessions_.find(file_id);
+                if (it != download_sessions_.end()) {
+                    it->second.download_size = offset + chunk_data.size();
+                    it->second.last_active = std::chrono::steady_clock::now();
+                }
+            }
+
+            if (chunk.is_last()) {
+                LOG_INFO << "File download completed: " << file_id;
+                {
+                    std::lock_guard<std::mutex> lock(sessions_mutex_);
+                    download_sessions_.erase(file_id);
+                }
+                break;
+            }
+
+            offset += chunk_data.size();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
 
     // 发送文件消息给接收方
     void sendFileMessage(const FileRecord& record, const p::MessageHeader& req_header) {
@@ -329,13 +477,90 @@ public:
         }
         else {  //下载
             std::lock_guard<std::mutex> lock(sessions_mutex_);
+            auto it = download_sessions_.find(file_id);
+            if(it != download_sessions_.end()) {
+                resp.set_success(true);
+                resp.set_offset(it->second.download_size);
+                resp.set_message("Resume download");
+            }
+            else {
+                resp.set_success(false);
+                resp.set_message("No downlaod session");
+            }
         }
+
+        p::MessageHeader resp_header;
+        resp_header.set_msg_id(header.msg_id() + 1);
+        resp_header.set_msg_type(p::MSG_FILE_RESUME_RESP);
+        resp_header.set_timestamp(tool::getTimestamp());
+
+        auto data = proto::MessageCodec::encode(resp_header, resp);
+        if(!data.empty()) {
+            conn->send(data.data(), data.size());
+        }
+    }
+
+    // 获取离线文件列表
+    void handleOfflineFiles(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        uint64_t user_id = conn->getUserID();
+        if(user_id == 0) {
+            sendFileResponse(conn, header, false, "User not logged in");
+            return ;  
+        }
+
+        FileDAO dao;
+        auto offline_records = dao.getOfflineFiles(user_id);
+        //  获取离线文件的详细信息
+        std::vector<FileRecord> file_records;
+        for(const auto& rec : offline_records) {
+            FileRecord file_rec;
+            if(dao.getFileByID(rec.file_id, file_rec)) {
+                // 检查文件是否存在
+                if(manage_.fileExists(rec.file_id)) {
+                    file_records.push_back(file_rec);
+                }
+                else {
+                    dao.deleteOfflineFileRecord(rec.file_id, user_id);
+                }
+            }
+        }
+
+        db::FileOfflineListResp resp;
+        resp.set_success(true);
+        resp.set_total_count(file_records.size());
+
+        for(const auto& rec : file_records) {
+            auto* file_info = resp.add_files();
+            file_info->set_file_id(rec.file_id);
+            file_info->set_filename(rec.filename);
+            file_info->set_file_size(rec.file_size);
+            file_info->set_md5(rec.md5);
+            file_info->set_mime_type(rec.mime_type);
+            file_info->set_upload_time(rec.upload_time);
+            file_info->set_expire_time(rec.expire_time);
+            file_info->set_from_uid(rec.from_uid);
+            file_info->set_to_uid(rec.to_uid);
+            file_info->set_status(rec.status);
+            file_info->set_is_offline(true);
+        }
+
+        p::MessageHeader resp_header;
+        resp_header.set_msg_id(header.msg_id() + 1);
+        resp_header.set_msg_type(p::MSG_FILE_OFFLINE_DOWNLOAD);
+        resp_header.set_timestamp(tool::getTimestamp());
+
+        auto data = proto::MessageCodec::encode(resp_header, resp);
+        if(!data.empty()) {
+            conn->send(data.data(), data.size());
+        }
+
+        LOG_INFO << "Offline files for user " << user_id << ": " << file_records.size();
     }
 
 
 private:
     FileManage manage_;
-    std::unordered_map<uint64_t, std::shared_ptr<TcpConnection>>* user_connection_;
+    std::unordered_map<uint64_t, std::shared_ptr<TcpConnection>>* user_connection_ = nullptr;
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, FileSession> upload_sessions_;
     std::unordered_map<std::string, FileSession> download_sessions_;

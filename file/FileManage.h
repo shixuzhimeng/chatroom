@@ -1,4 +1,4 @@
-#pragma once;
+#pragma once
 
 #include <string>
 #include <fstream>
@@ -18,6 +18,9 @@ public:
     }
 
     FileManage() = default;
+    ~FileManage() {
+        stopCleaner();
+    }
 
     // 初始化文件目录结构
     bool init(const std::string& base_dir, int expired_days = 7) {
@@ -87,6 +90,11 @@ public:
         return temp_dir_ + "/" + file_id + ".tmp";
     }
 
+    // 检查文件是否存在
+    bool fileExists(const std::string& file_id) {
+        return std::filesystem::exists(getFilePath(file_id));
+    }
+
     // 获取临时文件大小
     uint64_t getTempFileSize(const std::string& file_id) {
         std::string path = getTempPath(file_id);
@@ -119,7 +127,7 @@ public:
     // 将临时文件存储到最终的存储位置并且验证MD5
     bool completeUpload(const std::string& file_id, const std::string& expected_md5) {
         std::string temp_path = getTempPath(file_id);
-        std::string store_path = getTempPath(file_id);
+        std::string store_path = getFilePath(file_id);
 
         // 计算临时文件的MD5
         std::string actual_md5 = MD5Tool::calculateFile(temp_path);
@@ -131,7 +139,7 @@ public:
         
         try {
             // 检查文件是否存在
-            if(std::filesystem::exists(temp_path)) {
+            if(!std::filesystem::exists(temp_path)) {
                 LOG_ERROR << "Temp file not found: " << temp_path;
                 return false;
             }
@@ -225,8 +233,8 @@ public:
 
         try {
             std::filesystem::copy_file(src_path, dst_path);
-            LOG_ERROR << "Source file not found: " << src_path;
-            return false;
+            LOG_INFO << "file copied: " << src_path << " -> " << dst_path;
+            return true;
         }
         catch(const std::exception& e) {
             LOG_ERROR << "Failed to copy file: " << e.what();
@@ -248,7 +256,7 @@ public:
     bool deleteFile(const std::string& file_id, bool delete_db = true) {
         std::string path = getFilePath(file_id);
         if(std::filesystem::exists(path)) {
-            std::filesystem::exists(path);
+            std::filesystem::remove(path);
         }
 
         std::string temp_path = getTempPath(file_id);
