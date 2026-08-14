@@ -220,6 +220,7 @@ class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 public:
     using Callback = std::function<void(std::shared_ptr<TcpConnection>)>;
     using MessageCallback = std::function<void(std::shared_ptr<TcpConnection>, Buffer&)>;
+    std::chrono::steady_clock::time_point last_active_time;
 
     TcpConnection(int fd, int id = 0) : fd_(fd), connection_id(id), closed_(false), context(nullptr) {
         LOG_DEBUG << "Connection created: fd" << fd << std::endl;
@@ -359,6 +360,17 @@ public:
 
     bool isClosed() {
         return closed_;
+    }
+
+    void uploadActiveTime() {
+        last_active_time = std::chrono::steady_clock::now();
+    }
+
+    bool isTimeout(int timeout_seconds) {
+        auto now = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - last_active_time);
+
+        return duration.count() > timeout_seconds;
     }
 
 private:

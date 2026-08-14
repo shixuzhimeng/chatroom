@@ -141,6 +141,7 @@ private:
         LOG_INFO << "SubReactor " << id_ << " event loop started";
         
         while (running_) {
+            // 等待事件
             int n = epoll_wait(epoll_fd_, events.data(), events.size(), 100);
             if (n < 0) {
                 if (errno == EINTR) continue;
@@ -149,6 +150,7 @@ private:
                 break;
             }
             
+            // 就绪事件处理
             for (int i = 0; i < n; ++i) {
                 int fd = events[i].data.fd;
                 if (fd == wakeup_fd_) {
@@ -180,6 +182,25 @@ private:
                 }
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                     conn->handleClose();
+                }
+            }
+        }
+
+        // 超时检测
+        static int64_t last_check_time = 0;
+        int64_t now = tool::getTimestamp();
+        if(now - last_check_time > 10000) {
+            last_check_time = now;
+            int timeout_check = Config::getInstance().getInt("server.timeout", 60);
+            for(auto it = connections_.begin(); it != connections_.end(); ) {
+                auto& conn = it->second;
+                if(conn && conn->isTimeout(timeout_check)) {
+                    LOG_INFO << "Connection timeout: fd = " << conn->fd();
+                    conn->handleClose();
+                    it = connections_.erase(it);
+                }
+                else {
+                    ++it;
                 }
             }
         }
