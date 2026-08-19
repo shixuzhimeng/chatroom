@@ -14,14 +14,17 @@ class tool{
 public:
     // 去除空格
     static std::string trim(const std::string& str) {
-        size_t first = str.find_first_not_of("\t\n\r"); 
+        // 包含空格、制表符、换行符、回车符
+        const char* whitespace = " \t\n\r";
+        size_t first = str.find_first_not_of(whitespace);
         if(first == std::string::npos) {
             return "";
         }
-        size_t last = str.find_last_not_of("\t\n\r");
+        size_t last = str.find_last_not_of(whitespace);
         if(last == std::string::npos) {
-            return str.substr(first, last - first + 1);
+            return str.substr(first);
         }
+        return str.substr(first, last - first + 1);
     }
 
     // 分割字符串

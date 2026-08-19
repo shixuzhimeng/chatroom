@@ -8,11 +8,11 @@
 #include <sstream>
 
 #define LOG_INFO LOG(INFO) << "[INFO] "
-#define LOG_WARN LOG(WARN) << "[WARN] "
+#define LOG_WARN LOG(WARNING) << "[WARN] "
 #define LOG_ERROR LOG(ERROR) << "[ERROR] "
 #define LOG_FATAL LOG(FATAL) << "[FATAL] "
 
-#define LOG_DEBUG DLOG(INFO) << "[DEBUG] "  // 在Debug模式下输出
+#define LOG_DEBUG DLOG(INFO) << "[DEBUG] "
 
 
 // 条件日志
@@ -48,8 +48,4 @@ inline void LOGinit(const std::string& program_name, const std::string& log_dir 
 
 
     LOG_INFO << "LOG system init , Program: " << program_name;
-}
-
-static void shutdwn() {
-    google::ShutdownGoogleLogging();
 }

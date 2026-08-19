@@ -60,7 +60,7 @@ public:
         return true;
     }
 
-    // 手机号验证（中国）
+    // 手机号验证
     static bool validatePhone(const std::string& phone) {
         if (phone.empty()) return true;
         if (phone.length() != 11) {

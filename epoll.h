@@ -11,87 +11,8 @@
 #include <fcntl.h>
 #include "logging.h"
 #include <string>
-#include "reactor.h"
 #include "thread_pool.h"
-
-class NBSocket {
-public:
-    NBSocket() : fd_(-1) {}
-    explicit NBSocket(int fd) : fd_(fd) {}
-    ~NBSocket() {
-        if(fd_ > 0) {
-            close(fd_);
-        }
-    }
-
-    bool Socket(uint16_t port, const std::string& ip = "0.0.0.0") {
-        fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-        if(fd_ < 0) {
-            LOG_ERROR << "socket failed" << std::endl;
-            return false;
-        }
-
-        int opt = 1;
-        if(setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-            LOG_INFO << "setsockopt failed";
-        }
-
-        sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        if(inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) <= 0) {
-            LOG_ERROR << "Invalid IP address:" << ip;
-            return false;
-        }
-
-        if(bind(fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
-            LOG_ERROR << "bind failed" << std::endl;
-            return false;
-        }
-
-        if(listen(fd_, 128) < 0) {
-            LOG_ERROR << "listen faield" << std::endl;
-            return false;
-        }
-        
-        LOG_INFO << "Seerver listening on" << ip << ":" << port << std::endl;
-
-        return true;
-
-    }
-    int Accept() {
-        sockaddr_in client_addr;
-        socklen_t len = sizeof(client_addr);
-        
-        int client_fd = accept(fd_, (sockaddr*)&client_addr, &len);
-        
-        if(client_fd < 0) {
-            if(errno != EAGAIN && errno != EWOULDBLOCK) {
-                LOG_ERROR << "accept failed " << strerror(errno); 
-            }
-            return -1;
-        }
-        
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
- 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-        LOG_DEBUG << "Accepted connection from " << client_ip << ":" << ntohs(client_addr.sin_port);
-
-        return client_fd;
-    }
-
-    int fd() const{
-        return fd_;
-    }
-
-
-private:
-    int fd_;
-};
-
+#include "TLS/TLS.h"
 
 class EpollWrapper {
 public:
@@ -223,6 +144,7 @@ public:
     std::chrono::steady_clock::time_point last_active_time;
 
     TcpConnection(int fd, int id = 0) : fd_(fd), connection_id(id), closed_(false), context(nullptr) {
+        last_active_time = std::chrono::steady_clock::now();
         LOG_DEBUG << "Connection created: fd" << fd << std::endl;
     }
 
@@ -266,23 +188,54 @@ public:
     }
 
     void handleRead() {
+        LOG_INFO << "handle read called";
         char buf[1024 * 64];
         while(true) {
-            ssize_t n = read(fd_, buf, sizeof(buf));
-            if(n > 0) {
-                input_buffer.Append(buf, n);
-            }
-            else if(n == 0) {
-                handleClose();
-                break;
-            }
-            else if(errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
+            ssize_t n;
+            if (use_tls_ && tls_socket_) {
+                // 如果是TLS，需要处理握手
+                if (!tls_handshaked_) {
+                    int ret = tls_socket_->accept();
+                    if (ret == 0) {
+                        tls_handshaked_ = true;
+                        LOG_DEBUG << "TLS handshake completed";
+                    } else if (ret == -2) {
+                        // 需要重试
+                        break;
+                    } else {
+                        handleClose();
+                        return ;
+                    }
+                    continue;
+                }
+                n = tls_socket_->read(buf, sizeof(buf));
             }
             else {
-                LOG_ERROR << "Read error" << strerror(errno);
-                handleClose();
+                n = read(fd_, buf, sizeof(buf));
+            }
+
+            if (n > 0) {
+                input_buffer.Append(buf, n);
+            } else if (n == 0) {
+                LOG_INFO << "Connected closed by :fd:" << fd_;
+                if(!closed_) {
+                    closed_ = true;
+                    if(close_cb) {
+                        close_cb(shared_from_this());
+                    }
+                }
+                return ;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
+            } else {
+                LOG_ERROR << "Read error: " << strerror(errno);
+                if(!closed_) {
+                    closed_ = true;
+                    if(close_cb) {
+                        close_cb(shared_from_this());
+                    }
+                }
+                return ;
             }
         }
         if(!closed_ && input_buffer.readBytes() > 0) {
@@ -293,24 +246,26 @@ public:
     }
 
     void handleWrite() {
-        while(output_buffer.readBytes() > 0) {
-            ssize_t n = write(fd_, output_buffer.peek(), output_buffer.readBytes());
-            if(n > 0) {
+        while (output_buffer.readBytes() > 0) {
+            ssize_t n;
+            if (use_tls_ && tls_socket_ && tls_handshaked_) {
+                n = tls_socket_->write(output_buffer.peek(), output_buffer.readBytes());
+            } else {
+                n = write(fd_, output_buffer.peek(), output_buffer.readBytes());
+            }
+            if (n > 0) {
                 output_buffer.costBytes(n);
-            }
-            else if(errno == EAGAIN || errno == EWOULDBLOCK) {
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
-            }
-            else {
-                LOG_ERROR << "Write error" << strerror(errno);
+            } else {
+                LOG_ERROR << "Write error: " << strerror(errno);
                 handleClose();
                 break;
             }
         }
-        if(!closed_ && output_buffer.readBytes() == 0) {
-            if(write_cb) {
-                write_cb(shared_from_this());
-            }
+
+        if (!closed_ && output_buffer.readBytes() == 0 && write_cb) {
+            write_cb(shared_from_this());
         }
     }
 
@@ -373,6 +328,21 @@ public:
         return duration.count() > timeout_seconds;
     }
 
+    void enableTLS(SSL_CTX* ctx) {
+        if (!ctx) return;
+        
+        tls_socket_ = std::make_unique<TLSsocket>();
+        if (tls_socket_->init(ctx, fd_)) {
+            use_tls_ = true;
+            tls_handshaked_ = false;
+            LOG_INFO << "TLS enabled for connection " << connection_id;
+        }
+        else {
+            LOG_ERROR << "Failed to enable TLS for connection " << connection_id;
+            tls_socket_.reset();
+        }
+    }
+
 private:
     int fd_;
     int connection_id;
@@ -383,4 +353,8 @@ private:
     Callback close_cb;
     MessageCallback message_cb;
     void* context;
+
+    std::unique_ptr<TLSsocket> tls_socket_;
+    bool use_tls_ = false;
+    bool tls_handshaked_ = false;
 };

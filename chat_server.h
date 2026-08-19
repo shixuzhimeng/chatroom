@@ -20,7 +20,7 @@
 #include <chrono>
 #include "mysql/groupmessageDAO.h"
 #include "chat/groupmessagehandle.h"
-#include "file/FileHandle.h"
+#include "file/fileHandle.h"
 #include "HeartBeat/heartbeat.h"
 #include "limiter.h"
 #include "deduplicator.h"
@@ -28,11 +28,13 @@
 
 class ChatServer {
 public:
-    ChatServer(const std::string& host, uint16_t port, int sub_reactor = 4)
+    std::unordered_map<int, std::shared_ptr<TcpConnection>> user_connections_by_fd_;
+    ChatServer(const std::string& host, uint16_t port, int sub_reactor = 4, SSL_CTX* tls_ctx = nullptr)
         : host_(host),
           port_(port),
           sub_reactor_(sub_reactor),
-          running_(false) {
+          running_(false),
+          tls_ctx_(tls_ctx){
         
         // 从配置文件中读取线程数
         int threads = Config::getInstance().getInt("server.threads", 8);
@@ -40,14 +42,28 @@ public:
         LOG_INFO << "Thread pool created with " << threads << " threads";
 
         // 创建 MainReactor
-        main_reactor_ = std::make_unique<MainReactor>(host_, port_, sub_reactor_, thread_pool_.get());
+        main_reactor_ = std::make_shared<MainReactor>(host_, port_, sub_reactor_, thread_pool_.get());
+
+        for (auto& sub : main_reactor_->getSubReactors()) {
+            sub->setConnectionCreatedCallback(
+                [this](int fd, std::shared_ptr<TcpConnection> conn) {
+                    // 以 fd 为键存储连接
+                    user_connections_by_fd_[fd] = conn;
+                    LOG_DEBUG << "Connection created callback: fd=" << fd;
+                }
+            );
+        }
 
         // 设置消息回调
         main_reactor_->setMessageCallback(
             [this](std::shared_ptr<TcpConnection> conn, Buffer& buffer) {
                 handleMessage(conn, buffer);
             });
-
+        
+        main_reactor_->setConnectionHandler(
+            [this](int fd) {
+                this->addConnection(fd);
+            });
         // 1. ChatHandler
         chat_handler_.setUserConnections(&user_connections_);
         chat_handler_.setFriendDAO(&friend_dao_);
@@ -74,7 +90,8 @@ public:
     }
 
     void start() {
-        if (running_) return;
+        if(running_) 
+            return;
         running_ = true;
 
         // 启动 MainReactor
@@ -92,7 +109,7 @@ public:
 
         // 启动心跳超时检测线程
         timeout_thread_ = std::thread([this]() {
-            while (running_) {
+            while(running_) {
                 std::this_thread::sleep_for(std::chrono::seconds(10));
                 OnlineManager::getInstance().checkTimeout(30);
             }
@@ -105,15 +122,15 @@ public:
         if (!running_) return;
         running_ = false;
 
-        if (timeout_thread_.joinable()) {
+        if(timeout_thread_.joinable()) {
             timeout_thread_.join();
         }
 
-        if (main_reactor_) {
+        if(main_reactor_) {
             main_reactor_->stop();
         }
 
-        if (thread_pool_) {
+        if(thread_pool_) {
             thread_pool_.reset();
         }
 
@@ -123,31 +140,161 @@ public:
 private:
     // 消息处理
     void handleMessage(std::shared_ptr<TcpConnection> conn, Buffer& buffer) {
-        uint64_t user_id = conn->getUserID();
-        std::string key = "msg_" + std::to_string(user_id);
-        if(!msg_limiter_.isallow(key)) {
-            LOG_ERROR << "Message rate limit exceeded for user " << user_id;
-            sendLimitResponse(conn);
-            buffer.costall();
-            return ;
-        }
-        
-        while (buffer.readBytes() >= sizeof(uint32_t)) {
+        LOG_INFO << "handle message called";
+        LOG_INFO << "buffer.readBytes() = " << buffer.readBytes();
+
+        constexpr size_t PREFIX_SIZE = sizeof(uint32_t) * 2;
+        constexpr uint32_t MAX_PACKET_SIZE = 10 * 1024 * 1024;
+
+        while (buffer.readBytes() > 0) {
+
+            // 至少需要 total_len
+            if (buffer.readBytes() < sizeof(uint32_t)) {
+                LOG_DEBUG << "Not enough data for total_len, waiting for more";
+                break;
+            }
+
+            // --------------------------------
+            // 读取 total_len
+            // --------------------------------
+
+            uint32_t total_len = 0;
+
+            memcpy(
+                &total_len,
+                buffer.peek(),
+                sizeof(uint32_t)
+            );
+
+            total_len = ntohl(total_len);
+
+            LOG_INFO << "total_len = " << total_len;
+
+            // --------------------------------
+            // 检查 total_len
+            // --------------------------------
+
+            if (total_len == 0 || total_len > MAX_PACKET_SIZE) {
+                LOG_ERROR << "Invalid total_len: " << total_len;
+
+                // 当前协议流已经失去同步
+                buffer.costall();
+                break;
+            }
+
+            // --------------------------------
+            // 完整包大小
+            //
+            // total_len = header + body
+            //
+            // 完整包 =
+            // total_len(4)
+            // + header_len(4)
+            // + header
+            // + body
+            //
+            // = 8 + total_len
+            // --------------------------------
+
+            size_t packet_size =
+                sizeof(uint32_t) * 2 +
+                static_cast<size_t>(total_len);
+
+            LOG_INFO << "packet_size = " << packet_size;
+
+            // --------------------------------
+            // 半包
+            // --------------------------------
+
+            if (buffer.readBytes() < packet_size) {
+
+                LOG_DEBUG
+                    << "Not enough data for full packet, need "
+                    << packet_size
+                    << ", have "
+                    << buffer.readBytes();
+
+                break;
+            }
+
+            // --------------------------------
+            // 拷贝完整数据包
+            // --------------------------------
+
+            std::vector<char> data(
+                buffer.peek(),
+                buffer.peek() + packet_size
+            );
+
+            LOG_INFO << "开始解码, data.size() = "
+                    << data.size();
+
+            // --------------------------------
+            // decode
+            // --------------------------------
+
             p::MessageHeader header;
             std::vector<char> body;
             size_t consumed = 0;
 
-            // 解码
-            std::vector<char> data(buffer.peek(), buffer.peek() + buffer.readBytes());
-            if (!proto::MessageCodec::decode(data, consumed, header, body)) {
+            if (!proto::MessageCodec::decode(
+                    data,
+                    consumed,
+                    header,
+                    body))
+            {
+                LOG_ERROR << "解码失败";
+
+                // 不要随便丢数据
                 break;
             }
 
-            // 移除已处理的数据
+            LOG_INFO << "解码成功, consumed = "
+                    << consumed;
+
+            // --------------------------------
+            // 防御性检查
+            // --------------------------------
+
+            if (consumed != packet_size) {
+                LOG_ERROR
+                    << "Decode consumed mismatch: "
+                    << "consumed=" << consumed
+                    << ", packet_size=" << packet_size;
+
+                break;
+            }
+
+            // --------------------------------
+            // 消费完整数据
+            // --------------------------------
+
             buffer.costBytes(consumed);
 
-            // 分发消息
-            dispatcher_.Dispatcher(conn, header, body);
+            LOG_INFO << "分发消息, msg_type = "
+                    << header.msg_type();
+
+            // --------------------------------
+            // 分发
+            // --------------------------------
+
+            dispatcher_.Dispatcher(
+                conn,
+                header,
+                body
+            );
+        }
+    }
+
+    void addConnection(int fd) {
+        LOG_INFO << "char addconnection";
+        
+        if(main_reactor_) {
+            main_reactor_->addConnection(fd);
+        }
+        else {
+            LOG_ERROR << "main_reactor is null";
+            close(fd);
         }
     }
 
@@ -188,6 +335,15 @@ private:
         dispatcher_.registerHandle(p::MSG_VERIFICATION_CODE,
             [this](auto conn, auto& header, auto& body) {
                 auth_handler_.handleVerifyCode(conn, header, body);
+            });
+
+        dispatcher_.registerHandle(p::MSG_VERIFY_CODE_LOGIN,
+            [this](auto conn, auto& header, auto& body) {
+                auth_handler_.handleVerifyCode(conn, header, body);
+            });
+        dispatcher_.registerHandle(p::MSG_DELETE_ACCOUNT, 
+            [this](auto conn, auto& header, auto& body) {
+                auth_handler_.handleDeleteAccount(conn, header, body);
             });
 
         // 好友相关
@@ -406,26 +562,38 @@ private:
 
         p::LoginResponse response;
         if (found && Crypot::verifyPassword(request.password(), user.salt, user.password_hash)) {
+            std::string device_id = request.device_id().empty() ? "unknown" : request.device_id();
+            std::string token = TManager::getInstance().generateT(
+                user.user_id, 
+                user.username, 
+                device_id, 
+                24
+            );
+            
             response.set_success(true);
-            response.set_token("token_" + std::to_string(user.user_id));
+            response.set_token(token);
             response.set_uid(user.user_id);
             response.set_nickname(user.nickname);
 
             // 更新用户状态为在线
             user_dao.updateUserStatus(user.user_id, 1);
 
-            // 保存连接映射
-            user_connections_[user.user_id] = conn;
-            conn->setContext(reinterpret_cast<void*>(user.user_id));
-
-            // 更新心跳
-            OnlineManager::getInstance().updateHeartbeat(user.user_id);
-
-            // 发送离线消息
-            chat_handler_.sendOfflineMessage(user.user_id);
-
-            LOG_INFO << "User " << user.username << " (" << user.user_id << ") logged in";
-        } else {
+            auto it = user_connections_by_fd_.find(conn->fd());
+            if (it != user_connections_by_fd_.end()) {
+                auto correct_conn = it->second;
+                correct_conn->setContext(reinterpret_cast<void*>(user.user_id));
+                user_connections_[user.user_id] = correct_conn;
+                OnlineManager::getInstance().updateHeartbeat(user.user_id);
+                chat_handler_.sendOfflineMessage(user.user_id);
+                LOG_INFO << "User " << user.username << " (" << user.user_id << ") logged in";
+            }
+            else {
+                LOG_ERROR << "Connection not found for fd " << conn->fd();
+                response.set_success(false);
+                response.set_message("Internal error");
+            }
+        }
+        else {
             response.set_success(false);
             response.set_message("Invalid username or password");
             LOG_ERROR << "Login failed for " << request.username();
@@ -613,7 +781,33 @@ private:
         LOG_INFO << "Offline messages delivered to user " << user_id 
                  << " (private: " << sent_private << "/" << total_private 
                  << ", group: " << sent_group << "/" << total_group << ")";
-
+        // 检查待处理的好友请求
+        FriendDAO friend_dao;
+        auto pending_requests = friend_dao.getPendingRequestsForUser(user_id);
+        LOG_INFO << "User " << user_id << " has " << pending_requests.size() << " pending friend requests";
+        
+        for (const auto& req : pending_requests) {
+            auto conn = getConnection(user_id);
+            if (conn && !conn->isClosed()) {
+                p::CommonResponse resp;
+                resp.set_code(0);
+                resp.set_message("You have a pending friend request from " + std::to_string(req.from_uid));
+                resp.set_timestamp(tool::getTimestamp());
+                
+                p::MessageHeader header;
+                header.set_msg_type(p::MSG_COMMON_REQUEST);
+                header.set_timestamp(tool::getTimestamp());
+                header.set_request_id(req.request_id);
+                header.set_from_uid(req.from_uid);
+                header.set_to_uid(user_id);
+                
+                auto data = proto::MessageCodec::encode(header, resp);
+                if (!data.empty()) {
+                    conn->send(data.data(), data.size());
+                    LOG_INFO << "Pending friend request " << req.request_id << " delivered to user " << user_id;
+                }
+            }
+        }
 
     }
 
@@ -630,9 +824,11 @@ private:
     uint16_t port_;
     int sub_reactor_;
     std::atomic<bool> running_;
+    SSL_CTX* tls_ctx_ = nullptr;
+    std::atomic<int> connection_counter_{0};
 
     std::unique_ptr<ThreadPool> thread_pool_;
-    std::unique_ptr<MainReactor> main_reactor_;
+    std::shared_ptr<MainReactor> main_reactor_;
     std::thread timeout_thread_;
 
     proto::Dispatch dispatcher_;

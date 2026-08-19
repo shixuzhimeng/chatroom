@@ -1,4 +1,5 @@
 #pragma once
+
 #include "epoll.h"
 #include "logging.h"
 #include <vector>
@@ -10,6 +11,10 @@
 #include <mutex>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include "tool.h"
+#include "thread_pool.h"
+#include "JSON/Config.h"
 
 class Reactor {
 public:
@@ -74,7 +79,14 @@ public:
     }
     
     void addConnection(int fd) override {
-        auto conn = std::make_shared<TcpConnection>(fd, fd);
+        LOG_INFO << "subadd connection";
+        
+        if(fd < 0) {
+            LOG_ERROR << "Invalid fd: " << fd;
+            return ;
+        }
+        
+        auto conn = std::make_shared<TcpConnection>(fd);
         // 使用 weak_ptr 避免循环引用
         std::weak_ptr<SubReactor> weak_self = shared_from_this();
         conn->setMessageCallback([weak_self](ConnectionPtr c, Buffer& buf) {
@@ -105,6 +117,10 @@ public:
             return;
         }
         connections_[fd] = conn;
+
+        if(connection_created_cb_) {
+            connection_created_cb_(fd, conn);
+        }
         LOG_DEBUG << "SubReactor " << id_ << " add connection " << fd;
     }
     
@@ -115,6 +131,10 @@ public:
         LOG_DEBUG << "SubReactor " << id_ << " remove connection " << fd;
     }
     
+    void setConnectionCreatedCallback(std::function<void(int, ConnectionPtr)> cb) {
+        connection_created_cb_ = cb;
+    }
+
     void setMessageCallback(typename TcpConnection::MessageCallback cb) {
         message_cb_ = cb;
     }
@@ -150,6 +170,8 @@ private:
                 break;
             }
             
+            //LOG_INFO << "subReactor " << id_ << " wait"; 
+
             // 就绪事件处理
             for (int i = 0; i < n; ++i) {
                 int fd = events[i].data.fd;
@@ -157,6 +179,7 @@ private:
                     // 消耗唤醒事件
                     uint64_t dummy;
                     read(wakeup_fd_, &dummy, sizeof(dummy));
+                    LOG_INFO << "subreactor " << id_ << "wake up";
                     continue;
                 }
                 
@@ -169,38 +192,45 @@ private:
                     }
                 }
                 if (!conn || conn->isClosed()) {
-                    // 若连接已关闭但未删除，从 epoll 移除
                     epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                    std::lock_guard<std::mutex> lock(conn_mutex_);
+                    connections_.erase(fd);
+                    LOG_DEBUG << "SubReactor " << id_ << " cleaned up closed connection " << fd;
                     continue;
                 }
                 
                 if (events[i].events & (EPOLLIN | EPOLLRDHUP)) {
                     conn->handleRead();
+                    if(conn->isClosed()) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                        std::lock_guard<std::mutex> lock(conn_mutex_);
+                        connections_.erase(fd);
+                        LOG_DEBUG << "SubReactor " << id_ << " remove closed connect " << fd << "after read";
+                    }
                 }
-                if (events[i].events & EPOLLOUT) {
+                if (conn->isClosed() && (events[i].events & EPOLLOUT)) {
                     conn->handleWrite();
                 }
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                if (conn->isClosed() && (events[i].events & (EPOLLERR | EPOLLHUP))) {
                     conn->handleClose();
                 }
             }
-        }
-
-        // 超时检测
-        static int64_t last_check_time = 0;
-        int64_t now = tool::getTimestamp();
-        if(now - last_check_time > 10000) {
-            last_check_time = now;
-            int timeout_check = Config::getInstance().getInt("server.timeout", 60);
-            for(auto it = connections_.begin(); it != connections_.end(); ) {
-                auto& conn = it->second;
-                if(conn && conn->isTimeout(timeout_check)) {
-                    LOG_INFO << "Connection timeout: fd = " << conn->fd();
-                    conn->handleClose();
-                    it = connections_.erase(it);
-                }
-                else {
-                    ++it;
+            // 超时检测
+            int64_t now = tool::getTimestamp();
+            if(now - last_check_time > 10000) {
+                last_check_time = now;
+                int timeout_check = Config::getInstance().getInt("server.timeout", 60);
+                std::lock_guard<std::mutex> lock(conn_mutex_);
+                for(auto it = connections_.begin(); it != connections_.end(); ) {
+                    auto& conn = it->second;
+                    if(conn && conn->isTimeout(timeout_check)) {
+                        LOG_INFO << "Connection timeout: fd = " << conn->fd();
+                        conn->handleClose();
+                        it = connections_.erase(it);
+                    }
+                    else {
+                        ++it;
+                    }
                 }
             }
         }
@@ -208,10 +238,14 @@ private:
         // 清理所有连接
         {
             std::lock_guard<std::mutex> lock(conn_mutex_);
+            std::vector<ConnectionPtr> to_close;
             for (auto& pair : connections_) {
-                pair.second->handleClose();
+                to_close.push_back(pair.second);
             }
             connections_.clear();
+            for (auto& conn : to_close) {
+                conn->handleClose();
+            }
         }
         LOG_INFO << "SubReactor " << id_ << " event loop stopped";
     }
@@ -224,6 +258,9 @@ private:
     mutable std::mutex conn_mutex_;
     std::unordered_map<int, ConnectionPtr> connections_;
     typename TcpConnection::MessageCallback message_cb_;
+    std::function<void(int, ConnectionPtr)> connection_created_cb_;
+    int64_t last_check_time = 0;
+
 };
 
 class MainReactor : public Reactor, public std::enable_shared_from_this<MainReactor> {
@@ -321,10 +358,17 @@ public:
     }
     
     void addConnection(int fd) override {
+        LOG_INFO << "mainaddconnection";
+        if (sub_count_ <= 0) {
+            LOG_ERROR << "No sub-reactors available";
+            close(fd);
+            return;
+        }
         int idx = next_sub_.fetch_add(1) % sub_count_;
         if (idx < static_cast<int>(sub_reactors_.size())) {
             sub_reactors_[idx]->addConnection(fd);
-        } else {
+        }
+        else {
             close(fd);
         }
     }
@@ -352,6 +396,29 @@ public:
         return stats;
     }
     
+    void setConnectionHandler(std::function<void(int)> handler) {
+        connection_handler_ = handler;
+    }
+    
+    void addConnectionToReactor(int fd) {
+        LOG_INFO << "[MainReactor] addConnectionToReactor fd=" << fd;
+        if (sub_count_ <= 0) {
+            LOG_ERROR << "No sub-reactors available";
+            close(fd);
+            return;
+        }
+        int idx = next_sub_.fetch_add(1) % sub_count_;
+        if (idx < static_cast<int>(sub_reactors_.size())) {
+            sub_reactors_[idx]->addConnection(fd);
+        } else {
+            close(fd);
+        }
+    }
+
+    std::vector<std::shared_ptr<SubReactor>>& getSubReactors() {
+        return sub_reactors_;
+    }
+
 private:
     void EventLoop() {
         std::vector<epoll_event> events(1024);
@@ -384,11 +451,17 @@ private:
                             }
                             break;
                         }
+                        LOG_INFO << "New connection";
+                        if(connection_handler_) {
+                            connection_handler_(client_fd);
+                        }
+                        else {
+                            addConnection(client_fd);
+                        }
                         char client_ip[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
                         LOG_DEBUG << "New connection from " << client_ip 
                                   << ":" << ntohs(client_addr.sin_port);
-                        addConnection(client_fd);
                     }
                 }
             }
@@ -406,4 +479,5 @@ private:
     std::atomic<int> next_sub_;
     ThreadPool* thread_pool_;
     std::vector<std::shared_ptr<SubReactor>> sub_reactors_;
+    std::function<void(int)> connection_handler_;
 };
