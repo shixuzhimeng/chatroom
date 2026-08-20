@@ -7,12 +7,13 @@
 #include <vector>
 #include <memory>
 #include <functional>
-#include <vector>
 #include <unordered_map>
 #include <google/protobuf/util/json_util.h>
+#include <algorithm>
 
 using std::vector;
 namespace proto{
+
 class MessageCodec{
 public:
     // 编码
@@ -33,50 +34,121 @@ public:
         }
         
         std::vector<char> result;
-        uint32_t total_len = header_str.size() + body_str.size();
-        result.resize(sizeof(total_len) + total_len);
+        uint32_t header_len = header_str.size();
+        uint32_t body_len = body_str.size();
+        uint32_t total_len = header_len + body_len;
+        uint32_t net_total_len = htonl(total_len);
+        uint32_t net_header_len = htonl(header_len);
+        
+        result.resize(sizeof(net_total_len) + sizeof(net_header_len) + total_len);
+        
+        size_t pos = 0;
+        memcpy(result.data() + pos, &net_total_len, sizeof(net_total_len));
+        pos += sizeof(net_total_len);
+        memcpy(result.data() + pos, &net_header_len, sizeof(net_header_len));
+        pos += sizeof(net_header_len);
+        memcpy(result.data() + pos, header_str.data(), header_len);
+        pos += header_len;
+        memcpy(result.data() + pos, body_str.data(), body_len);
 
-        memcpy(result.data(), &total_len, sizeof(total_len));
-        memcpy(result.data() + sizeof(total_len), header_str.data(), header_str.size());
-        memcpy(result.data() + sizeof(total_len) + header_str.size(), body_str.data(), body_str.size());
-
-        LOG_DEBUG << "type : " << header.msg_type() << "len : " << total_len;
+        LOG_INFO << "encode: type=" << header.msg_type() 
+                << ", total_len=" << total_len 
+                << ", header_len=" << header_len
+                << ", body_len=" << body_len;
 
         return result;
     }
 
-
     // 解码
-    static bool decode(vector<char>& data, size_t& consumed, p::MessageHeader& header, vector<char>& body) {
+    static bool decode(const std::vector<char>& data, size_t& consumed, p::MessageHeader& header, std::vector<char>& body){
+        LOG_INFO << "decode: ENTER, data.size()=" << data.size();
+
         consumed = 0;
-        if (data.size() < sizeof(uint32_t)) return false;
-        
-        uint32_t total_len;
-        memcpy(&total_len, data.data(), sizeof(uint32_t));
-        total_len = ntohl(total_len);
-        
-        if (data.size() < sizeof(uint32_t) + total_len) return false;
-        
-        size_t pos = sizeof(uint32_t);
-        
-        // 解析 header
-        if (!header.ParseFromArray(data.data() + pos, total_len)) {
-            LOG_ERROR << "header parse failed";
+        body.clear();
+        header.Clear();
+
+        constexpr size_t PREFIX_LEN = sizeof(uint32_t) * 2;
+
+
+        if (data.size() < PREFIX_LEN) {
+            LOG_INFO << "decode: incomplete prefix, need="
+                    << PREFIX_LEN
+                    << ", have=" << data.size();
             return false;
         }
-        
-        // 获取 header 实际序列化长度
-        size_t header_len = header.ByteSizeLong();
-        pos += header_len;
-        
-        uint32_t body_len = header.body_length();
-        if (body_len > 0 && body_len <= total_len - header_len) {
-            body.assign(data.data() + pos, data.data() + pos + body_len);
-            pos += body_len;
+
+        uint32_t total_len = 0;
+        uint32_t header_len = 0;
+
+        memcpy(&total_len,
+            data.data(),
+            sizeof(uint32_t));
+
+        memcpy(&header_len,
+            data.data() + sizeof(uint32_t),
+            sizeof(uint32_t));
+
+        total_len = ntohl(total_len);
+        header_len = ntohl(header_len);
+
+        LOG_INFO << "decode: total_len=" << total_len
+                << ", header_len=" << header_len;
+
+        // 防止整数/长度异常
+        if (total_len < header_len) {
+            LOG_ERROR << "decode FAILED: total_len < header_len";
+            return false;
         }
-        
-        consumed = pos;
-        LOG_DEBUG << "type: " << header.msg_type() << ", body_len: " << body_len << ", consumed: " << consumed;
+
+        // 一个完整包的总长度：
+        // 4 + 4 + total_len
+        const size_t packet_len = PREFIX_LEN + total_len;
+
+        if (data.size() < packet_len) {
+            LOG_INFO << "decode: incomplete packet, need="
+                    << packet_len
+                    << ", have=" << data.size();
+            return false;
+        }
+
+        size_t pos = PREFIX_LEN;
+
+        if (!header.ParseFromArray(
+                data.data() + pos,
+                header_len))
+        {
+            LOG_ERROR << "decode: header ParseFromArray failed";
+            return false;
+        }
+
+        LOG_INFO << "decode: header parsed"
+                << ", msg_type=" << header.msg_type()
+                << ", body_length=" << header.body_length();
+
+        pos += header_len;
+
+
+        const size_t body_len = total_len - header_len;
+
+        if (header.body_length() != body_len) {
+            LOG_ERROR << "decode FAILED: body length mismatch, "
+                    << "header.body_length()=" << header.body_length()
+                    << ", actual=" << body_len;
+            return false;
+        }
+
+        if (body_len > 0) {
+            body.assign(
+                data.data() + pos,
+                data.data() + pos + body_len
+            );
+        }
+
+        consumed = packet_len;
+
+        LOG_INFO << "decode: SUCCESS, consumed="
+                << consumed;
+
         return true;
     }
 };
@@ -87,22 +159,26 @@ public:
 
     void registerHandle(p::MessageType type, handle handle) {
         handles[type] = handle;
-        LOG_INFO << "registerHandle for type :" << type << std::endl;
+        LOG_INFO << "registerHandle for type :" << type;
     }
 
     void Dispatcher(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        LOG_INFO << "Dispatcher: msg_type=" << header.msg_type();  // ← 添加这行
+        
         auto it = handles.find(header.msg_type());
 
         if(it != handles.end()) {
+            LOG_INFO << "Dispatcher: found handler for type " << header.msg_type();  // ← 添加这行
             try {
                 it->second(conn, header, body);
+                LOG_INFO << "Dispatcher: handler executed successfully";  // ← 添加这行
             }
             catch(const std::exception& e) {
-                LOG_ERROR << "Handle exception" << e.what() << std::endl;
+                LOG_ERROR << "Handle exception: " << e.what();
             }
         }
         else {
-            LOG_INFO << "No handle for this type" << header.msg_type() << std::endl;
+            LOG_INFO << "No handle for this type: " << header.msg_type();
         }
     }
 
@@ -114,11 +190,9 @@ private:
     std::unordered_map<p::MessageType, handle> handles;
 };
 
-
 // json和protobuf相互转换
 class PS{
 public:
-    // 将消息换为Json类
     template<typename T>
     static std::string toJ(const T& message) {
         std::string json_str;
@@ -126,12 +200,9 @@ public:
         return json_str;
     }
 
-
-    // 将Json类转换为消息
     template<typename T>
     static bool fromJson(const std::string& json, T& message) {
         auto status = google::protobuf::util::JsonStringToMessage(json, &message);
-  
         return status.ok();
     }
 };

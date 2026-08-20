@@ -32,6 +32,46 @@ enum MessageType {
     MSG_PENDING_REQUESTS = 26;
     MSG_PROCESS_REQUEST = 27;
     MSG_GROUP_NOTIFICATION = 28;
+    MSG_HISTORY = 29;
+    MSG_READ_RECEIPT = 30;
+    MSG_UNREAD_COUNT = 31;
+    MSG_CONVERSATION_LIST = 32;
+    MSG_RECALL = 33;
+    MSG_OFFLINE_NOTIFY = 34;
+    MSG_GROUP_PUSH = 35;
+    MSG_GROUP_RECALL = 36;
+    MSG_GROUP_UNREAD = 37;
+    MSG_GROUP_CHAT = 38;
+    MSG_GROUP_HISTORY = 39;
+    MSG_GROUP_READ = 40;
+    MSG_FILE_UPLOAD_REQ = 41;
+    MSG_FILE_UPLOAD_RESP = 42;
+    MSG_FILE_UPLOAD_CHUNK = 43;
+    MSG_FILE_UPLOAD_COMPLETE = 44;
+    MSG_FILE_DOWNLOAD_REQ = 45;
+    MSG_FILE_DOWNLOAD_RESP = 46;
+    MSG_FILE_DOWNLOAD_CHUNK = 47;
+    MSG_FILE_MESSAGE = 48;
+    MSG_FILE_OFFLINE_NOTIFY = 49;
+    MSG_FILE_RESUME_REQ = 50;
+    MSG_FILE_RESUME_RESP = 51;
+    MSG_FILE_OFFLINE_LIST_REQ = 52;
+    MSG_FILE_OFFLINE_DOWNLOAD = 53;
+    MSG_HEARTBEAT_RESP = 54;
+    MSG_COMMON_RESPONSE = 55;
+    MSG_VERIFY_CODE_LOGIN = 56;
+    MSG_BLOCK_LIST_RESPONSE = 57;
+    MSG_BLOCK_LIST_REQUEST = 58;
+    MSG_FILE_CHUNK = 59;
+    MSG_DELETE_ACCOUNT = 60;
+    MSG_GROUP_FILE_UPLOAD_REQ = 61;
+    MSG_GROUP_FILE_UPLOAD_CHUNK = 62;
+    MSG_GROUP_FILE_MESSAGE = 63;
+    MSG_FILE_OFFLINE_LIST_RESP = 64;
+    MSG_COMMON_REQUEST = 65;
+    MSG_GET_OFFLINE_MESSAGES = 66;
+    MSG_OFFLINE_MESSAGES_RESP = 67;
+    MSG_MARK_OFFLINE_READ = 68;
 }
 
 message MessageHeader {
@@ -41,6 +81,7 @@ message MessageHeader {
     uint64 timestamp = 4;
     uint64 from_uid = 5;
     uint64 to_uid = 6;
+    uint64 request_id = 7;
 }
 
 message LoginRequest {
@@ -63,6 +104,17 @@ message ChatMessage {
     string content = 3;
     uint32 msg_type = 4;
     string extra = 5;
+    int64 timestamp = 6;
+    uint64 msg_id = 7;
+}
+
+message GroupChatMessage {
+    uint64 from_uid = 1;
+    uint64 group_uid = 2;
+    string content = 3;
+    uint32 msg_type = 4;
+    string extra = 5;
+    int64 timestamp = 6;
 }
 
 message FriendRequest {
@@ -98,11 +150,21 @@ message EchoResponse {
 
 message Heartbeat {
     uint64 timestamp = 1;
+    uint64 client_time = 2;  // 客户端的时间戳
+    uint64 seq = 3;          // 序列号（去重）
 }
 
+message HeartbeatResp {
+    uint64 timestamp = 1;
+    uint64 server_time = 2;
+    uint64 seq = 3;
+    int64 latency_ms = 4; // 延迟毫秒
+}
+
+// 通用响应消息
 message CommonResponse {
-    int32 code = 1;
-    string message = 2;
+    int32 code = 1;         // 状态码
+    string message = 2;     // 状态描述
     uint64 timestamp = 3;
 }
 
@@ -132,6 +194,24 @@ message CodeResponse {
     int32 expire_seconds = 2;
 }
 
+// 验证码登录
+message VerifyCodeLoginRequest {
+    string email = 1;
+    string code = 2;
+    string device_id = 3;
+}
+
+message DeleteAccountRequest {
+    string token = 1;      // 当前会话token，用于验证
+    bool confirm = 2;
+    string password = 3;
+}
+
+message DeleteAccountResponse {
+    bool success = 1;
+    string message = 2;
+}
+
 message FriendRequestMsg {
     uint64 to_uid = 1;
     string message = 2;
@@ -156,6 +236,9 @@ message FriendListResponse {
     repeated FriendInfo friends = 1;
 }
 
+message GetFriendListRequest {
+}
+
 // 删除好友请求
 message DeleteFriendRequest {
     uint64 friend_id = 1;
@@ -169,6 +252,9 @@ message BlockUserRequest {
 // 取消屏蔽请求
 message UnblockUserRequest {
     uint64 block_id = 1;
+}
+
+message BlockListRequest {
 }
 
 // 屏蔽列表响应
@@ -223,6 +309,7 @@ message CreateGroupRequest {
     int32 max_members = 5;
     bool is_public = 6;
     int32 join_type = 7;
+    repeated uint64 initial_member_ids = 8;
 }
 
 // 创建群组响应
@@ -320,4 +407,194 @@ message GroupNotification {
     uint64 group_id = 2;
     uint64 user_id = 3;
     string message = 4;
+}
+
+// 历史消息请求
+message GetHistoryRequest {
+    uint64 target_uid = 1;
+    int32 limit = 2;
+    int64 before_time = 3;
+}
+
+// 历史消息响应
+message HistoryResponse {
+    bool success = 1;
+    string message = 2;
+    uint64 target_uid = 3;
+    repeated HistoryMessage messages = 4;
+}
+
+message HistoryMessage {
+    uint64 msg_id = 1;
+    uint64 from_uid = 2;
+    uint64 to_uid = 3;
+    string content = 4;
+    int32 msg_type = 5;
+    int32 status = 6;
+    bool is_recalled = 7;
+    int64 created_at = 8;
+    int64 delivered_at = 9;
+    int64 read_at = 10;
+}
+
+// 标记已读请求
+message MarkReadRequest {
+    uint64 from_uid = 1;  // 0表示全部标记
+}
+
+// 已读回执
+message ReadReceipt {
+    uint64 user_id = 1;
+    int64 timestamp = 2;
+}
+
+// 未读数量响应
+message UnreadCountResponse {
+    bool success = 1;
+    string message = 2;
+    int32 total_unread = 3;
+    repeated UnreadItem unread_items = 4;
+}
+
+message UnreadItem {
+    uint64 from_uid = 1;
+    int32 count = 2;
+}
+
+// 会话列表响应
+message ConversationListResponse {
+    bool success = 1;
+    string message = 2;
+    repeated ConversationItem conversations = 3;
+}
+
+message ConversationListRequest {
+
+}
+
+message ConversationItem {
+    uint64 user_id = 1;
+    string username = 2;
+    string nickname = 3;
+    string avatar = 4;
+    string last_msg_content = 5;
+    int64 last_msg_time = 6;
+    int32 unread_count = 7;
+    int32 online_status = 8;
+}
+
+// 撤回消息请求
+message RecallMessageRequest {
+    uint64 msg_id = 1;
+}
+
+// 消息撤回通知
+message MessageRecall {
+    uint64 msg_id = 1;
+    uint64 from_uid = 2;
+    uint64 to_uid = 3;
+    int64 recalled_at = 4;
+}
+
+// 离线消息通知
+message OfflineMessageNotify {
+    int32 count = 1;
+    int64 timestamp = 2;
+    int32 group_count = 3;
+    int32 total_count = 4;
+    int32 private_count = 5;
+}
+
+message OnlineStatusRequest {
+    repeated uint64 target_ids = 1;  // 要查询的用户ID列表，为空则返回所有好友
+}
+
+// 添加在线状态响应
+message OnlineStatusResponse {
+    bool success = 1;
+    string message = 2;
+    
+    message OnlineInfo {
+        uint64 user_id = 1;
+        string username = 2;
+        string nickname = 3;
+        string avatar = 4;
+        bool is_online = 5;
+    }
+    
+    repeated OnlineInfo online_info = 3;
+}
+
+message GroupChatRequest {
+    uint64 group_id = 1;
+    string content = 2;
+    int32 msg_type = 3;
+    string extra = 4;
+}
+
+message GroupMessagePush {
+    uint64 msg_id = 1;
+    uint64 group_id = 2;
+    uint64 from_uid = 3;
+    string from_username = 4;
+    string content = 5;
+    int32 msg_type = 6;
+    int64 created_at = 7;
+}
+
+message GroupHistoryRequest {
+    uint64 group_id = 1;
+    int32 limit = 2;
+    int64 before_time = 3;
+}
+
+message GroupHistoryResponse {
+    bool success = 1;
+    string message = 2;
+    uint64 group_id = 3;
+    repeated GroupHistoryItem messages = 4;
+}
+
+message GroupHistoryItem {
+    uint64 msg_id = 1;
+    uint64 from_uid = 2;
+    string from_username = 3;
+    string content = 4;
+    int32 msg_type = 5;
+    bool is_recalled = 6;
+    int64 created_at = 7;
+}
+
+message RecallGroupMessageRequest {
+    uint64 msg_id = 1;
+}
+
+message GroupRecall {
+    uint64 msg_id = 1;
+    uint64 group_id = 2;
+    uint64 from_uid = 3;
+    int64 recalled_at = 4;
+}
+
+message MarkGroupReadRequest {
+    uint64 group_id = 1;
+    uint64 last_msg_id = 2;
+}
+
+message GroupUnreadResponse {
+    bool success = 1;
+    string message = 2;
+    int32 total_unread = 3;
+    repeated GroupUnreadItem unread_items = 4;
+}
+
+message GroupUnreadItem {
+    uint64 group_id = 1;
+    string group_name = 2;
+    int32 unread_count = 3;
+}
+
+message GetOfflineMessagesRequest {
+    int32 limit = 1;        // 最大获取数量
+    int64 before_time = 2;  // 获取此时间之前的消息（用于分页）
 }

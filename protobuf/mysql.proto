@@ -1,0 +1,299 @@
+syntax = "proto3";
+
+package db;
+
+
+// 消息扩展信息（存储在messages.extra字段）
+message MessageExtra {
+    uint64 msg_id = 1;
+    uint64 from_uid = 2;
+    uint64 to_uid = 3;
+    int32 chat_type = 4;
+    int32 msg_type = 5;
+    string content = 6;
+    int64 created_at = 7;
+    int64 delivered_at = 8;
+    int64 read_at = 9;
+    int32 status = 10;
+    bool is_recalled = 11;
+    int64 recalled_at = 12;
+    
+    // 扩展字段
+    map<string, string> metadata = 13;
+}
+
+// 群消息扩展信息（存储在group_messages.extra字段）
+message GroupMessageExtra {
+    uint64 msg_id = 1;
+    uint64 group_id = 2;
+    uint64 from_uid = 3;
+    int32 msg_type = 4;
+    string content = 5;
+    int64 created_at = 6;
+    bool is_recalled = 7;
+    int64 recalled_at = 8;
+    repeated uint64 mention_list = 9;
+    int32 status = 10;
+    
+    map<string, string> metadata = 11;
+}
+
+
+// 用户设置（存储在users.settings字段）
+message UserSettings {
+    bool is_online = 1;
+    int32 status = 2;          // 0:离线, 1:在线, 2:忙碌, 3:离开
+    string device_id = 3;
+    string device_type = 4;
+    int64 last_active_time = 5;
+    int64 login_time = 6;
+    string ip_address = 7;
+    
+    // 用户偏好
+    bool enable_sound = 8;
+    bool enable_notification = 9;
+    string language = 10;
+    string theme = 11;
+    
+    map<string, string> custom_settings = 12;
+}
+
+// 好友信息（存储在friendships.extra字段）
+message FriendExtra {
+    string remark = 1;
+    string group_name = 2;
+    int64 add_time = 3;
+    int64 last_chat_time = 4;
+    bool is_top = 5;           // 是否置顶
+    bool is_blocked = 6;       // 是否屏蔽
+    map<string, string> metadata = 7;
+}
+
+// 群组信息（存储在groups.extra字段）
+message GroupExtra {
+    string announcement = 1;
+    string description = 2;
+    int64 created_at = 3;
+    int64 updated_at = 4;
+    bool is_public = 5;
+    int32 join_type = 6;
+    int32 max_members = 7;
+    repeated uint64 admin_list = 8;
+    map<string, string> metadata = 9;
+}
+
+// 群成员信息（存储在group_members.extra字段）
+message GroupMemberExtra {
+    string nickname = 1;
+    int64 join_time = 2;
+    int64 last_read_time = 3;
+    bool is_muted = 4;
+    int64 muted_until = 5;
+    int32 role = 6;            // 0:普通成员, 1:管理员, 2:群主
+    map<string, string> metadata = 7;
+}
+
+
+// 会话信息（存储在sessions.extra字段）
+message SessionExtra {
+    string token = 1;
+    string device_id = 2;
+    string device_type = 3;
+    string ip_address = 4;
+    string user_agent = 5;
+    int64 login_time = 6;
+    int64 last_active_time = 7;
+    int64 expire_time = 8;
+    bool is_active = 9;
+    map<string, string> metadata = 10;
+}
+
+
+// 离线消息信息（存储在offline_messages.extra字段）
+message OfflineMessageExtra {
+    uint64 user_id = 1;
+    uint64 msg_id = 2;
+    int64 received_at = 3;
+    bool is_delivered = 4;
+    int64 delivered_at = 5;
+    int32 msg_type = 6;        // 消息类型：私聊/群聊
+    map<string, string> metadata = 7;
+}
+
+
+// 系统配置（存储在system_config.extra字段）
+message SystemConfigExtra {
+    int64 updated_at = 1;
+    string description = 2;
+    int32 version = 3;
+    map<string, string> metadata = 4;
+}
+
+enum FileMessageType {
+    FILE_UPLOAD_REQ = 0;
+    FILE_UPLOAD_RESP = 1;
+    FILE_UPLOAD_CHUNK = 2;
+    FILE_UPLOAD_COMPLETE = 3;
+    FILE_DOWNLOAD_REQ = 4;
+    FILE_DOWNLOAD_RESP = 5;
+    FILE_DOWNLOAD_CHUNK = 6;
+    FILE_MESSAGE = 7;           // 发送给接收方的文件消息
+    FILE_OFFLINE_NOTIFY = 8;    // 离线文件通知
+    FILE_RESUME_REQ = 9;        // 断点续传请求
+    FILE_RESUME_RESP = 10;
+    FILE_OFFLINE_DOWNLOAD = 11; // 离线文件下载
+    MSG_FILE_CHUNK = 12;
+}
+
+// 文件元信息
+message FileInfo {
+    string file_id = 1;
+    string filename = 2;
+    uint64 file_size = 3;
+    string md5 = 4;
+    string mime_type = 5;
+    int64 upload_time = 6;
+    int64 expire_time = 7;
+    uint64 from_uid = 8;
+    uint64 to_uid = 9;
+    int32 status = 10;          // 0:上传中, 1:上传完成, 2:已过期, 3:已删除
+    bool is_offline = 11;
+    uint64 group_id = 12;
+}
+
+// 文件块信息
+message FileChunk {
+    string file_id = 1;
+    int32 chunk_index = 2;
+    bytes data = 3;
+    bool is_last = 4;
+    uint64 timestamp = 5;
+    int64 offset = 6;
+}
+
+// 文件上传请求
+message FileUploadReq {
+    FileInfo file_info = 1;
+    uint32 chunk_size = 2;
+    uint64 request_id = 3;
+}
+
+// 文件上传响应
+message FileUploadResp {
+    bool success = 1;
+    string file_id = 2;
+    string message = 3;
+    uint64 uploaded_size = 4;   // 已上传大小
+    bool is_duplicate = 5;      // 是否已经存在相同的文件
+    string existing_file_id = 6;// 已经存在的文件的ID
+}
+
+// 文件上传分片
+message FileUploadChunk {
+    string file_id = 1;
+    uint32 chunk_index = 2;
+    bytes data = 3;
+    bool is_last = 4;
+    uint64 offset = 5;
+}
+
+// 文件上传完成
+message FileUploadComplete {
+    string file_id = 1;
+    bool success = 2;
+    string md5 = 3;
+    uint64 file_size = 4;
+}
+
+// 文件下载请求
+message FileDownloadReq {
+    string file_id = 1;
+    uint64 offset = 2;
+}
+
+// 文件下载响应
+message FileDownloadResp {
+    bool success = 1;
+    string file_id = 2;
+    string filename = 3;
+    uint64 file_size = 4;
+    uint64 offset = 5;
+    string message = 6;
+    string md5 = 7;
+    bool is_offline = 8;
+}
+
+// 文件下载分片
+message FileDownloadChunk {
+    string file_id = 1;
+    uint32 chunk_index = 2;
+    bytes data = 3;
+    bool is_last = 4;
+    uint64 offset = 5;
+}
+
+// 文件消息（发送给接收方的通知）
+message FileMessage {
+    string file_id = 1;
+    string filename = 2;
+    uint64 file_size = 3;
+    string md5 = 4;
+    uint64 from_uid = 5;
+    uint64 to_uid = 6;
+    int64 send_time = 7;
+    string text = 8;
+    bool is_offline = 9;
+}
+
+// 群组文件上传请求
+message GroupFileUploadReq {
+    db.FileInfo file_info = 1;   // 文件元信息
+    uint64 group_id = 2;         // 目标群组ID
+    uint32 chunk_size = 3;       // 分块大小
+    uint64 request_id = 4;       // 请求ID，用于响应
+}
+
+// 群组文件分块
+message GroupFileChunk {
+    string file_id = 1;
+    uint32 chunk_index = 2;
+    uint64 offset = 3;
+    bytes data = 4;
+    bool is_last = 5;
+}
+
+// 离线文件通知
+message FileOfflineNotify {
+    repeated string file_ids = 1;
+    int32 total_count = 2;
+    int64 timestamp = 3;
+}
+
+// 断点续传请求
+message FileResumeReq {
+    string file_id = 1;
+    uint64 offset = 2;
+    int32 direction = 3;        // 0:上传, 1:下载
+    uint64 request_id = 4;
+}
+
+// 断点续传响应
+message FileResumeResp {
+    bool success = 1;
+    uint64 offset = 2;
+    string message = 3;
+}
+
+// 获取离线文件列表请求
+message FileOfflineListReq {
+    repeated string file_ids = 1;
+    int32 limit = 2;
+}
+
+// 获取离线文件列表响应
+message FileOfflineListResp {
+    bool success = 1;
+    string message = 2;
+    repeated FileInfo files = 3;
+    int32 total_count = 4;
+}
