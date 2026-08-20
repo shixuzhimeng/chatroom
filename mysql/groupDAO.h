@@ -56,13 +56,15 @@ class GroupDAO : public BaseDAO {
 public:
     // 建群
     bool createGroup(const Group& group, uint64_t& group_id) {
-        TransactionGuard tx(*this);
-        
-        std::string sql = "INSERT INTO groups (group_name, group_avatar, owner_id, description, "
-                          "announcement, max_members, is_public, join_type, created_at, updated_at) VALUES ('";
+        LOG_INFO << "Start creategroup";
+        LOG_INFO << "Group name: " << group.group_name;
+        LOG_INFO << "Owner ID: " << group.owner_id;
+
+        std::string sql = "INSERT INTO `groups` (group_name, group_avatar, owner_id, description, "
+                        "announcement, max_members, is_public, join_type, created_at, updated_at) VALUES ('";
         sql += escapeString(group.group_name) + "', '";
-        sql += escapeString(group.group_avatar) + "', '";
-        sql += std::to_string(group.owner_id) + "', '";
+        sql += escapeString(group.group_avatar) + "', ";
+        sql += std::to_string(group.owner_id) + ", '";
         sql += escapeString(group.description) + "', '";
         sql += escapeString(group.announcement) + "', ";
         sql += std::to_string(group.max_members) + ", ";
@@ -71,34 +73,24 @@ public:
         sql += std::to_string(group.created_at) + ", ";
         sql += std::to_string(group.updated_at) + ")";
 
+        LOG_INFO << "Create group SQL: " << sql;
+
         if(!executeUpdate(sql)) {
             LOG_ERROR << "Create group failed";
             return false;
         }
 
-        group_id = getLastInserterID();
+        group_id = getLastInsertID();
+        LOG_INFO << "Group inserted, last_insert_id: " << group_id;
 
-        // 群主自动入群且身份为群主
-        GroupMember owner;
-        owner.group_id = group_id;
-        owner.user_id = group.owner_id;
-        owner.role = 2;
-        owner.join_time = group.created_at;
-        owner.last_read_time = group.created_at;
-
-        if(!addMember(owner)) {
-            LOG_ERROR << "Failed to add owner to group";
-            return false;
-        }
-
-        LOG_INFO << "Group created: " << group.group_name << " (id=" << group_id << ")";
-        tx.commit();
+        // 不在这里添加群主，由调用者统一添加
+        LOG_INFO << "Group record created: " << group.group_name << " (id=" << group_id << ")";
         return true;
     }
 
     // 由群组ID获取群
     bool getGroupByID(uint64_t group_id, Group& group)  {
-        std::string sql = "SELECT g.*, u.username as owner_name FROM groups g "
+        std::string sql = "SELECT g.*, u.username as owner_name FROM `groups` g "
                           "LEFT JOIN users u ON g.owner_id = u.user_id "
                           "WHERE g.group_id = " + std::to_string(group_id);
 
@@ -122,7 +114,7 @@ public:
 
     // 添加成员
     bool addMember(const GroupMember& member) {
-        std::string sql = "INSERT INTO group_members (group_id, user_id, role, nickname, "
+        std::string sql = "INSERT IGNORE INTO group_members (group_id, user_id, role, nickname, "
         "join_time, last_read_time, is_muted, muted_until) VALUES (";
 
         sql += std::to_string(member.group_id) + ", ";
@@ -134,11 +126,16 @@ public:
         sql += std::to_string(member.is_muted ? 1 : 0) + ", ";
         sql += std::to_string(member.muted_until) + ")";
 
-        return executeUpdate(sql);
+        LOG_DEBUG << "Add member SQL: " << sql;
+
+        bool result = executeUpdate(sql);
+
+        LOG_INFO << "addMember executeUpdate result: " << (result ? "true" : "false");
+        return result;
     }
 
     bool getGroupByName(const std::string& name, std::vector<Group>& groups) {
-        std::string sql = "SELECT g.*, u.username as owner_name FROM groups g "
+        std::string sql = "SELECT g.*, u.username as owner_name FROM `groups` g "
                           "LEFT JOIN users u ON g.owner_id = u.user_id "
                           "WHERE g.group_name LIKE '%" + escapeString(name) + "%' "
                           "ORDER BY g.group_id DESC LIMIT 100";
@@ -158,7 +155,7 @@ public:
     }
 
     bool updateGroupInfo(const Group& group) {
-        std::string sql = "UPDATE groups SET "
+        std::string sql = "UPDATE `groups` SET "
                           "group_name = '" + escapeString(group.group_name) + "', "
                           "group_avatar = '" + escapeString(group.group_avatar) + "', "
                           "description = '" + escapeString(group.description) + "', "
@@ -183,7 +180,7 @@ public:
         }
         
         // 删除群
-        std::string del_group = "DELETE FROM groups WHERE group_id = " + std::to_string(group_id);
+        std::string del_group = "DELETE FROM `groups` WHERE group_id = " + std::to_string(group_id);
         if(!executeUpdate(del_group)) {
             LOG_ERROR << "Failed to delete group";
             return false;
@@ -214,6 +211,13 @@ public:
         std::string sql = "UPDATE group_members SET nickname = '" + escapeString(nickname) + "' "
                           "WHERE group_id = " + std::to_string(group_id) + 
                           " AND user_id = " + std::to_string(user_id);
+
+        return executeUpdate(sql);
+    }
+
+    bool deleteAllgroup(uint64_t user_id) {
+        char sql[512];
+        snprintf(sql, sizeof(sql), "DELETE FROM group_members WHERE user_id = %lu", user_id);
 
         return executeUpdate(sql);
     }
@@ -284,7 +288,7 @@ public:
     // 获取用户加入的群组
     std::vector<Group> getUserGroup(uint64_t user_id) {
         std::vector<Group> groups;
-        std::string sql = "SELECT g.*, u.username as owner_name FROM groups g "
+        std::string sql = "SELECT g.*, u.username as owner_name FROM `groups` g "
                           "LEFT JOIN users u ON g.owner_id = u.user_id "
                           "WHERE g.group_id IN (SELECT group_id FROM group_members WHERE user_id = " + std::to_string(user_id) +
                           ") " "ORDER BY g.updated_at DESC";

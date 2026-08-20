@@ -9,6 +9,7 @@
 #include <functional>
 #include "protobuf/mysql_p.h"
 #include <nlohmann/json.hpp>
+#include "../Check.h"
 
 class BaseDAO {
 public:
@@ -27,9 +28,17 @@ public:
         return executeUpdate("ROLLBACK");
     }
 
+    bool inTransaction() const {
+        return in_transaction_;
+    }
+
+    void setConnection(MYSQL* conn) {
+        conn_ = conn;
+    }
 
 
-protected:
+
+
     // 查询操作
     bool executeQuery(const std::string& sql, std::vector<std::map<std::string, std::string>>& result) {
         putbackConnection conn;
@@ -71,6 +80,9 @@ protected:
 
     // 更新数据（增，删，改）
     bool executeUpdate(const std::string& sql) {
+        LOG_DEBUG << "start executeUpdate";
+        LOG_DEBUG << "SQL: " << sql;
+        
         putbackConnection conn;
         if(!conn.connect()) {
             LOG_ERROR << "Database connection failed";
@@ -80,18 +92,19 @@ protected:
             LOG_ERROR << "Update failed:" << mysql_errno(conn.get()) << "SQL:" << sql;
             return false;
         }
+        
+        // 如果是 INSERT 语句，保存最后插入的 ID
+        if (sql.find("INSERT") == 0) {
+            last_insert_id_ = mysql_insert_id(conn.get());
+            LOG_INFO << "executeUpdate: inserted ID = " << last_insert_id_;
+        }
+        
         return true;
     }
-
+protected:
     // 获取新插入的ID
-    uint64_t getLastInserterID() {
-        putbackConnection conn;
-        if(!conn.connect()) {
-            LOG_ERROR << "Database connection failed";
-            return 0;
-        }
-
-        return mysql_insert_id(conn.get());
+    uint64_t getLastInsertID() {
+        return last_insert_id_;
     }
 
     // 防止SQL注入
@@ -122,6 +135,8 @@ protected:
         }
         return where;
     }
+
+    
 
     template<typename T>
     std::string sExtra(const T& message) {
@@ -169,4 +184,17 @@ protected:
         }
         return result;
     }
+
+    std::string safeSqlValidator(const std::string& input) {
+        if(InputValidator::hasSQLInjectionRisk(input)) {
+            LOG_ERROR << "SQL injection risk delected in input";
+            return "";
+        }
+
+        return escapeString(input);
+    }
+
+    MYSQL* conn_ = nullptr;
+    uint64_t last_insert_id_ = 0;
+    bool in_transaction_ = false;
 };

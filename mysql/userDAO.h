@@ -42,12 +42,15 @@ public:
         sql += escapeString(settings_json) + "', ";
         sql += std::to_string(user.created_at) + ", ";
         sql += std::to_string(user.updated_at) + ")";
+
+        LOG_INFO << "createUser: SQL=" << sql;
         
         if(executeUpdate(sql)) {
-            user_id = getLastInserterID();
+            user_id = getLastInsertID();
             return true;
         }
 
+        LOG_ERROR << "createUser: FAILED";
         return false;
     }
 
@@ -147,6 +150,41 @@ public:
         return users;
     }
 
+    // 批量查询
+    std::vector<USER> getUsersByIds(const std::vector<uint64_t>& uids) {
+        std::vector<USER> result;
+        
+        // 如果传入的ID列表为空，直接返回空结果
+        if (uids.empty()) {
+            return result;
+        }
+
+        // 构建SQL查询语句
+        std::string sql = "SELECT * FROM users WHERE user_id IN (";
+        
+        for (size_t i = 0; i < uids.size(); ++i) {
+            sql += std::to_string(uids[i]);
+            if (i + 1 < uids.size()) {
+                sql += ", ";
+            }
+        }
+        sql += ")";
+
+        // 查询
+        std::vector<std::map<std::string, std::string>> rows;
+        if (!executeQuery(sql, rows) || rows.empty()) {
+            return result;
+        }
+
+        // 将查询结果转换为结构体对象
+        for (const auto& row : rows) {
+            USER user;
+            fillUserFromMap(row, user);
+            result.push_back(user);
+        }
+
+        return result;
+    }
 
 private:
     void fillUserFromMap(const std::map<std::string, std::string>& row, USER& user) {

@@ -85,7 +85,7 @@ public:
             return false;
         }
         
-        msg_id = getLastInserterID();
+        msg_id = getLastInsertID();
         LOG_DEBUG << "Group message saved: " << msg_id << " in group " << msg.group_id;
         tx.commit();
         return true;
@@ -169,6 +169,8 @@ public:
         sql += std::to_string(tool::getTimestamp()) + ", 0)";
         return executeUpdate(sql);
     }
+
+    
     
     std::vector<GroupMessage> getGroupOfflineMessages(uint64_t user_id) {
         std::vector<GroupMessage> messages;
@@ -288,6 +290,12 @@ public:
         int64_t cutoff_time = tool::getTimestamp() - days * 24 * 3600 * 1000;
         std::string sql = "DELETE FROM group_offline_messages WHERE received_at < " + 
                          std::to_string(cutoff_time);
+        return executeUpdate(sql);
+    }
+
+    bool deleteMessagesGroup(uint64_t user_id) {
+        char sql[512];
+        snprintf(sql, sizeof(sql), "DELETE FROM group_messages WHERE from_uid = %lu", user_id);
         return executeUpdate(sql);
     }
     

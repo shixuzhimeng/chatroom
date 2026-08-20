@@ -77,7 +77,7 @@ public:
             return false;
         }
 
-        msg_id = getLastInserterID();
+        msg_id = getLastInsertID();
         LOG_DEBUG << "Message saved: " << msg_id << " from " << msg.from_uid << " to " << msg.to_uid;
 
         return true;
@@ -131,7 +131,8 @@ public:
 
         std::string sql = "SELECT * FROM messages WHERE chat_type = 1 AND ("
                           "(from_uid = " + std::to_string(user1_id) + " AND to_uid = " + std::to_string(user2_id) + 
-                          ") OR " "(from_uid = " + std::to_string(user2_id) + " AND to_uid = " + std::to_string(user1_id) + "))";
+                          ") OR " "(from_uid = " + std::to_string(user2_id) + " AND to_uid = " + std::to_string(user1_id) + "))"
+                          " AND is_recalled = 0";
         if(before_time > 0) {
             sql += " AND created_at < " + std::to_string(before_time);
         }
@@ -280,6 +281,13 @@ public:
         return executeUpdate(sql);
     }
 
+    bool deleteAllOfflineMessages(uint64_t user_id) {
+        char sql[512];
+        snprintf(sql, sizeof(sql),
+            "DELETE FROM offline_messages WHERE user_id = %lu", user_id);
+        return executeUpdate(sql);
+    }
+
     // 获取离线消息
     std::vector<Message> getOfflineMessages(uint64_t user_id) {
         std::vector<Message> messages;
@@ -385,10 +393,14 @@ public:
 
         for(const auto& row : result) {
             ConversationInfo info;
-            uint64_t other_uid = std::stoull(row.at("other_uid"));
+            auto it_other = row.find("other_uid");
+            if (it_other == row.end()) 
+                continue;
+            uint64_t other_uid = std::stoull(it_other->second);
             info.user_id = other_uid;
-            info.last_msg_id = std::stoull(row.at("last_msg_id"));
-            info.last_msg_time = std::stoll(row.at("last_msg_time"));
+            
+            auto it_last_time = row.find("last_time");
+            info.last_msg_time = (it_last_time != row.end() && !it_last_time->second.empty()) ? std::stoll(it_last_time->second) : 0;
         
             // 获取用户的信息
             std::string user_sql = "SELECT username, nickname, avatar, status FROM users WHERE user_id = " +std::to_string(other_uid);
@@ -455,6 +467,12 @@ public:
         // 升序
         std::reverse(messages.begin(), messages.end());
         return messages;
+    }
+
+    bool deleteAllMessage(uint64_t user_id) {
+        char sql[512];
+        snprintf(sql, sizeof(sql), "DELETE FROM messages WHERE from_uid = %lu OR to_uid = %lu", user_id, user_id);
+        return executeUpdate(sql);
     }
 
 private:
