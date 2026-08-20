@@ -111,7 +111,7 @@ public:
         timeout_thread_ = std::thread([this]() {
             while(running_) {
                 std::this_thread::sleep_for(std::chrono::seconds(10));
-                OnlineManager::getInstance().checkTimeout(30);
+                OnlineManager::getInstance().checkTimeout(45);
             }
         });
 
@@ -137,6 +137,89 @@ public:
         LOG_INFO << "ChatServer stopped";
     }
 
+    void init() {
+        // 注册超时回调
+        OnlineManager::getInstance().setTimeoutCallback(
+            [this](uint64_t user_id) {
+                onUserTimeout(user_id);
+            }
+        );
+    }
+
+     void onUserTimeout(uint64_t user_id) {
+        LOG_INFO << "Timeout callback for user " << user_id;
+        
+        // 1. 获取用户的连接
+        auto conn = getConnectionByUser(user_id);
+        if (conn && !conn->isClosed()) {
+            LOG_INFO << "Closing timeout connection for user " << user_id 
+                     << ", fd=" << conn->fd();
+            conn->handleClose();
+        }
+        
+        // 2. 从映射中移除）
+        removeUserConnection(user_id);
+    }
+
+    void removeUserConnection(uint64_t user_id) {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        
+        auto it = user_connections_.find(user_id);
+        if (it != user_connections_.end()) {
+            int fd = it->second ? it->second->fd() : -1;
+            if (fd > 0) {
+                user_connections_by_fd_.erase(fd);
+            }
+            user_connections_.erase(it);
+            LOG_DEBUG << "Removed user " << user_id << " from connection manager";
+        }
+    }
+
+    std::shared_ptr<TcpConnection> getConnectionByUser(uint64_t user_id) {
+        auto it = user_connections_.find(user_id);
+        if (it != user_connections_.end()) {
+            auto conn = it->second;
+            if (conn && !conn->isClosed()) {
+                return conn;
+            }
+            // 连接已关闭，清理映射
+            user_connections_.erase(it);
+        }
+        return nullptr;
+    }
+
+    void addConnection(int fd, std::shared_ptr<TcpConnection> conn) {
+        user_connections_by_fd_[fd] = conn;
+    }
+
+    void bindUser(int fd, uint64_t user_id) {
+        auto it = user_connections_by_fd_.find(fd);
+        if (it != user_connections_by_fd_.end()) {
+            user_connections_[user_id] = it->second;
+        }
+    }
+
+    void onNewConnection(int fd) {
+        auto conn = std::make_shared<TcpConnection>(fd);
+        
+        // 设置关闭回调
+        conn->setCloseCallBack([this](std::shared_ptr<TcpConnection> conn) {
+            LOG_INFO << "Connection closed callback for fd " << conn->fd();
+            
+            // 从映射中移除
+            uint64_t user_id = conn->getUserID();
+            if (user_id > 0) {
+                removeUserConnection(user_id);
+            }
+            // 从 fd 映射中移除
+            std::lock_guard<std::mutex> lock(connection_mutex_);
+            user_connections_by_fd_.erase(conn->fd());
+        });
+        
+        // 添加到映射
+        addConnection(fd, conn);
+    }
+
 private:
     // 消息处理
     void handleMessage(std::shared_ptr<TcpConnection> conn, Buffer& buffer) {
@@ -154,10 +237,7 @@ private:
                 break;
             }
 
-            // --------------------------------
             // 读取 total_len
-            // --------------------------------
-
             uint32_t total_len = 0;
 
             memcpy(
@@ -170,10 +250,7 @@ private:
 
             LOG_INFO << "total_len = " << total_len;
 
-            // --------------------------------
             // 检查 total_len
-            // --------------------------------
-
             if (total_len == 0 || total_len > MAX_PACKET_SIZE) {
                 LOG_ERROR << "Invalid total_len: " << total_len;
 
@@ -182,45 +259,21 @@ private:
                 break;
             }
 
-            // --------------------------------
-            // 完整包大小
-            //
-            // total_len = header + body
-            //
-            // 完整包 =
-            // total_len(4)
-            // + header_len(4)
-            // + header
-            // + body
-            //
-            // = 8 + total_len
-            // --------------------------------
 
-            size_t packet_size =
-                sizeof(uint32_t) * 2 +
-                static_cast<size_t>(total_len);
+            size_t packet_size = sizeof(uint32_t) * 2 + static_cast<size_t>(total_len);
 
             LOG_INFO << "packet_size = " << packet_size;
 
-            // --------------------------------
             // 半包
-            // --------------------------------
-
             if (buffer.readBytes() < packet_size) {
 
                 LOG_DEBUG
-                    << "Not enough data for full packet, need "
-                    << packet_size
-                    << ", have "
-                    << buffer.readBytes();
+                    << "Not enough data for full packet, need " << packet_size << ", have " << buffer.readBytes();
 
                 break;
             }
 
-            // --------------------------------
             // 拷贝完整数据包
-            // --------------------------------
-
             std::vector<char> data(
                 buffer.peek(),
                 buffer.peek() + packet_size
@@ -229,10 +282,7 @@ private:
             LOG_INFO << "开始解码, data.size() = "
                     << data.size();
 
-            // --------------------------------
             // decode
-            // --------------------------------
-
             p::MessageHeader header;
             std::vector<char> body;
             size_t consumed = 0;
@@ -249,13 +299,9 @@ private:
                 break;
             }
 
-            LOG_INFO << "解码成功, consumed = "
-                    << consumed;
+            LOG_INFO << "解码成功, consumed = " << consumed;
 
-            // --------------------------------
             // 防御性检查
-            // --------------------------------
-
             if (consumed != packet_size) {
                 LOG_ERROR
                     << "Decode consumed mismatch: "
@@ -265,19 +311,12 @@ private:
                 break;
             }
 
-            // --------------------------------
             // 消费完整数据
-            // --------------------------------
-
             buffer.costBytes(consumed);
 
-            LOG_INFO << "分发消息, msg_type = "
-                    << header.msg_type();
+            LOG_INFO << "分发消息, msg_type = " << header.msg_type();
 
-            // --------------------------------
             // 分发
-            // --------------------------------
-
             dispatcher_.Dispatcher(
                 conn,
                 header,
@@ -562,6 +601,14 @@ private:
 
         p::LoginResponse response;
         if (found && Crypot::verifyPassword(request.password(), user.salt, user.password_hash)) {
+            auto existing_conn = getConnectionByUser(user.user_id);
+            if(existing_conn && !existing_conn->isClosed()) {
+                LOG_INFO << "User" << user.username << "already has connection, close old one";
+                existing_conn->handleClose();
+            }
+            
+            OnlineManager::getInstance().removeUser(user.user_id);
+
             std::string device_id = request.device_id().empty() ? "unknown" : request.device_id();
             std::string token = TManager::getInstance().generateT(
                 user.user_id, 
@@ -575,23 +622,15 @@ private:
             response.set_uid(user.user_id);
             response.set_nickname(user.nickname);
 
+            conn->setContext(reinterpret_cast<void*>(user.user_id));
+
             // 更新用户状态为在线
             user_dao.updateUserStatus(user.user_id, 1);
+            OnlineManager::getInstance().updateHeartbeat(user.user_id);
 
-            auto it = user_connections_by_fd_.find(conn->fd());
-            if (it != user_connections_by_fd_.end()) {
-                auto correct_conn = it->second;
-                correct_conn->setContext(reinterpret_cast<void*>(user.user_id));
-                user_connections_[user.user_id] = correct_conn;
-                OnlineManager::getInstance().updateHeartbeat(user.user_id);
-                chat_handler_.sendOfflineMessage(user.user_id);
-                LOG_INFO << "User " << user.username << " (" << user.user_id << ") logged in";
-            }
-            else {
-                LOG_ERROR << "Connection not found for fd " << conn->fd();
-                response.set_success(false);
-                response.set_message("Internal error");
-            }
+            addConnection(conn->fd(), conn);
+            bindUser(conn->fd(), user.user_id);
+
         }
         else {
             response.set_success(false);
@@ -607,6 +646,9 @@ private:
         auto data = proto::MessageCodec::encode(resp_header, response);
         if (!data.empty()) {
             conn->send(data.data(), data.size());
+        }
+        if (found) {
+            onUserLogin(user.user_id);
         }
     }
 
@@ -826,6 +868,7 @@ private:
     std::atomic<bool> running_;
     SSL_CTX* tls_ctx_ = nullptr;
     std::atomic<int> connection_counter_{0};
+    std::mutex connection_mutex_;
 
     std::unique_ptr<ThreadPool> thread_pool_;
     std::shared_ptr<MainReactor> main_reactor_;

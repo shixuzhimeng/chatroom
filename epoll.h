@@ -13,7 +13,7 @@
 #include <string>
 #include "thread_pool.h"
 #include "TLS/TLS.h"
-
+#include "friend/OnlineManager.h"
 class EpollWrapper {
 public:
     EpollWrapper() {
@@ -143,7 +143,7 @@ public:
     using MessageCallback = std::function<void(std::shared_ptr<TcpConnection>, Buffer&)>;
     std::chrono::steady_clock::time_point last_active_time;
 
-    TcpConnection(int fd, int id = 0) : fd_(fd), connection_id(id), closed_(false), context(nullptr) {
+    TcpConnection(int fd, int id = 0, EpollWrapper* epoll = nullptr) : fd_(fd), connection_id(id), closed_(false), context(nullptr) {
         last_active_time = std::chrono::steady_clock::now();
         LOG_DEBUG << "Connection created: fd" << fd << std::endl;
     }
@@ -218,23 +218,13 @@ public:
                 input_buffer.Append(buf, n);
             } else if (n == 0) {
                 LOG_INFO << "Connected closed by :fd:" << fd_;
-                if(!closed_) {
-                    closed_ = true;
-                    if(close_cb) {
-                        close_cb(shared_from_this());
-                    }
-                }
+                handleClose();
                 return ;
             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {
                 LOG_ERROR << "Read error: " << strerror(errno);
-                if(!closed_) {
-                    closed_ = true;
-                    if(close_cb) {
-                        close_cb(shared_from_this());
-                    }
-                }
+                handleClose();
                 return ;
             }
         }
@@ -270,12 +260,41 @@ public:
     }
 
     void handleClose() {
-        if(!closed_) {
-            closed_ = true;
-            LOG_INFO << "Connection closed: fd " << fd_ << std::endl;
+        if(closed_) {
+            return ;
+        }
+
+        closed_ = true;
+        LOG_INFO << "Closing connection fd = " << fd_;
+
+        if(fd_ > 0) {
+            close(fd_);
+            fd_ = -1;
+            LOG_DEBUG << "Success closed fd " << fd_;
+        }
+
+        if(context) {
+            uint64_t user_id = reinterpret_cast<uint64_t>(context);
+            
+            LOG_INFO << "Cleaning up user " << user_id << " from connection";
+            
+            // 从 OnlineManager 移除
+            OnlineManager::getInstance().removeUser(user_id);
+            
+            // 更新数据库为离线
+            UserDAO dao;
+            dao.updateUserStatus(user_id, 0);
+            
+            // 清理连接映射
             if(close_cb) {
                 close_cb(shared_from_this());
             }
+            
+            context = nullptr;
+        }
+
+        if(tls_socket_) {
+            tls_socket_.reset();
         }
     }
 

@@ -10,8 +10,18 @@ public:
     // 构造函数：传入 DAO 对象，自动开启事务
     explicit TransactionGuard(BaseDAO& dao) 
         : dao_(dao), committed_(false) {
-        if (!dao_.beginTransaction()) {
-            throw std::runtime_error("Failed to begin transaction");
+        LOG_DEBUG << "Transaction started";
+        if (!dao_.inTransaction()) {
+            if (dao_.beginTransaction()) {
+                started_ = true;
+                LOG_DEBUG << "Transaction started";
+            } else {
+                LOG_ERROR << "Failed to begin transaction";
+                throw std::runtime_error("Failed to begin transaction");
+            }
+        } else {
+            LOG_DEBUG << "Already in transaction, reusing existing";
+            started_ = false;
         }
     }
     
@@ -28,11 +38,13 @@ public:
     
     // 手动提交事务
     void commit() {
+        LOG_DEBUG << "Committing transaction...";
         if (!committed_) {
             if (!dao_.commitTransaction()) {
                 throw std::runtime_error("Failed to commit transaction");
             }
             committed_ = true;
+            LOG_DEBUG << "Transaction committed";
         }
     }
     
@@ -56,4 +68,5 @@ public:
 private:
     BaseDAO& dao_;
     bool committed_;
+    bool started_;
 };
