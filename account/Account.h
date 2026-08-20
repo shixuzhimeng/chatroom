@@ -1,19 +1,23 @@
 #pragma once
 
-#include "../protobuf/p.h"
-#include "../mysql/userDAO.h"
+#include "protobuf/p.h"
+#include "mysql/userDAO.h"
 #include "HashSalt.h"
 #include "yanzheng.h"
 #include "Manager.h"
 #include "../logging.h"
 #include "../epoll.h"
-#include <regex>
+#include "Check.h"
+#include "limiter.h"
+#include "mysql/groupmessageDAO.h"
+
 
 class AuthHandler {
 public:
     AuthHandler() = default;
 
     void handleRegister(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        LOG_INFO << "handle register";
         p::RegisterRequest request;
         if(!request.ParseFromArray(body.data(), body.size())) {
             sendCommonResponse(conn, header, false, "Invaild request");
@@ -22,28 +26,34 @@ public:
 
         LOG_INFO << "Register request from " << request.username();
 
-        // 验证用户名格式
-        if(!validateUsername(request.username())) {
-            sendCommonResponse(conn, header, false, "Invalid username format (3-20) char, letters/digits/_");
+        LOG_INFO << "username=[" << request.username() << "]";
+        LOG_INFO << "password=[" << request.password() << "]";
+        LOG_INFO << "email=[" << request.email() << "]";
+        LOG_INFO << "nickname=[" << request.nickname() << "]";
+        LOG_INFO << "nickname size=" << request.nickname().size();
+
+        for (unsigned char c : request.nickname()) {
+            LOG_INFO << "nickname byte=0x"
+                    << std::hex
+                    << static_cast<int>(c)
+                    << std::dec;
+        }
+
+        // 检验输入验证
+        auto result = InputValidator::validateRegisterInput(
+            request.username(),
+            request.password(),
+            request.email(),
+            request.nickname()
+        );
+
+        if(!result.valid) {
+            sendCommonResponse(conn, header, false, result.error);
             return ;
         }
 
-        // 检验邮箱
-        if(!validataEmail(request.email())) {
-            sendCommonResponse(conn, header, false, "Invalid email format");
-            return ;
-        }
-
-        // 验证密码
-        if(!validataPassword(request.password())) {
-            sendCommonResponse(conn, header, false, "Password too weak");
-            return ;
-        }
-
-        // 验证验证码
-        std::string key = "register_" + request.email();
-        if(!YanZheng::getInstance().verifycode(key, request.verification_code())) {
-            sendCommonResponse(conn, header, false, "Invalid or expired verifycode");
+        if(InputValidator::hasSQLInjectionRisk(request.username()) || InputValidator::hasSQLInjectionRisk(request.email())) {
+            sendCommonResponse(conn, header, false, "Invalid input");
             return ;
         }
 
@@ -102,6 +112,12 @@ public:
         }
         LOG_INFO << "LogIn request from " << request.username();
         
+        std::string key = "logon_" + request.username();
+        if(!LimiterManage::getInstance().getLoginLimit().isallow(key)) {
+            sendCommonResponse(conn, header, false, "Login attemps too frequent");
+            return ;
+        }
+
         UserDAO user_dao;
         USER user;
         if(!user_dao.getUserByUsername(request.username(), user)) {
@@ -120,7 +136,7 @@ public:
         std::string token = TManager::getInstance().generateT(user.user_id, user.username, devic_id, 24);
         
         // 更新在线状态
-        user_dao.updateUserStatus(user.user_id, 1);
+        OnlineManager::getInstance().userOnline(user.user_id);
 
         // 构造登录响应
         p::LoginResponse response;
@@ -152,6 +168,11 @@ public:
             return ;
         }
 
+        uint64_t user_id = conn->getUserID();
+        if (user_id != 0) {
+            OnlineManager::getInstance().userOffline(user_id);
+        }
+
         std::string token = request.token();
         if(token.empty()) {
             sendCommonResponse(conn, header, false, "Token required");
@@ -160,7 +181,7 @@ public:
 
         TManager::TInfo info;
         if(!TManager::getInstance().verifyT(token, info)) {
-            sendCommonResponse(conn, header, false, "INvalid token");
+            sendCommonResponse(conn, header, false, "Invalid token");
             return ;
         }
         
@@ -176,6 +197,98 @@ public:
 
         sendCommonResponse(conn, header, true, "Logout success");
         LOG_INFO << "User LogOut : " << info.username << "(uid = " << info.user_id << ")"; 
+    }
+
+    // 注销账户处理
+    void handleDeleteAccount(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        p::DeleteAccountRequest request;
+        if(!request.ParseFromArray(body.data(), body.size())) {
+            sendCommonResponse(conn, header, false, "Invalid requset");
+            return ;
+        }
+
+        uint64_t user_id = conn->getUserID();
+        if(user_id == 0) {
+            sendCommonResponse(conn, header, false, "User not logged in");
+            return ;
+        }
+
+        std::string TID = request.token();
+        if(TID.empty()) {
+            sendCommonResponse(conn, header, false, "TID required");
+            return ;
+        }
+
+        TManager::TInfo info;
+        if(!TManager::getInstance().verifyT(TID, info)) {
+            sendCommonResponse(conn, header, false, "Invalid token");
+            return ;
+        }
+
+        if(!request.confirm()) {
+            sendCommonResponse(conn, header, false, "Invalid required");
+            return ;
+        }
+
+        if(!request.password().empty()) {
+            UserDAO user_dao;
+            USER user;
+            if(!user_dao.getUserByID(info.user_id, user)) {
+                sendCommonResponse(conn, header, false, "User not found");
+                return ;
+            }
+            if(!Crypot::verifyPassword(request.password(), user.salt, user.password_hash)) {
+                sendCommonResponse(conn, header, false, "Invalid password");
+                return ;
+            }
+        }
+
+        try {
+            FriendDAO friend_dao;
+            GroupDAO group_dao;
+            MessageDAO msg_dao;
+            GroupMessageDAO g_msg_dao;
+            UserDAO user_dao;
+
+            TransactionGuard tx(user_dao);
+            friend_dao.deleteAllFriend(info.user_id);
+            group_dao.deleteAllgroup(info.user_id);
+            msg_dao.deleteAllMessage(info.user_id);
+            msg_dao.deleteAllOfflineMessages(info.user_id);
+            g_msg_dao.deleteMessagesGroup(info.user_id);
+
+            if(!user_dao.deleteUser(info.user_id)) {
+                throw std::runtime_error("delete user failed");
+            }
+
+            TManager::getInstance().revokeAlltID(info.user_id);
+
+            tx.commit();
+        }
+        catch(const std::exception& e) {
+            LOG_ERROR << "Delete account failed";
+            sendCommonResponse(conn, header, false, "Deleted failed");
+            return ;
+        }
+
+        p::CommonResponse response;
+        response.set_code(0);
+        response.set_message("Account deleted success");
+        response.set_timestamp(tool::getTimestamp());
+
+        p::MessageHeader resp_header;
+        resp_header.set_msg_id(header.msg_id() + 1);
+        resp_header.set_msg_type(p::MSG_DELETE_ACCOUNT);
+        resp_header.set_timestamp(tool::getTimestamp());
+
+        auto data = proto::MessageCodec::encode(resp_header, response);
+        if(!data.empty()) {
+            conn->send(data.data(), data.size());
+        }
+
+        conn->isClosed();
+
+        LOG_INFO << "User account deleted: " << info.username << " (uid = " << info.user_id << " )";
     }
 
     // 验证码请求
@@ -212,10 +325,101 @@ public:
         LOG_INFO << "Verification code sent to email: " << email;
     }
 
+    // 验证码登录
+    void handleVerifyCodeLogin(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        p::VerifyCodeLoginRequest request;
+        if(!request.ParseFromArray(body.data(), body.size())) {
+            sendCommonResponse(conn, header, false, "Invalid request");
+            return ;
+        }
+
+        std::string email = request.email();
+        std::string code = request.code();
+        std::string device_id = request.device_id();
+
+        // 验证邮箱格式
+        if(!validataEmail(email)) {
+            sendCommonResponse(conn, header, false, "Invalid email");
+            return ;
+        }
+
+        // 验证验证码
+        std::string key = "register_" + email;
+        std::string shored_code = YanZheng::getInstance().generateCode(key);
+        if(shored_code.empty()) {
+            sendCommonResponse(conn, header, false, "Verifycation code expried");
+            return ;
+        }
+
+        if(YanZheng::getInstance().verifycode(shored_code, code)) {
+            sendCommonResponse(conn, header, false, "Invalid verify code");
+            return ;
+        }
+
+        YanZheng::getInstance().cleanExpired();
+
+        UserDAO user_dao;
+        USER  user;
+
+        if (!user_dao.getUserByEmail(email, user)) {
+            // 邮箱未注册，自动创建账号
+            user.username = email;
+            user.email = email;
+            user.nickname = email.substr(0, email.find('@'));
+            user.status = 0;
+            user.created_at = tool::getTimestamp();
+            user.updated_at = tool::getTimestamp();
+            user.salt = Crypot::generateSalt(16);
+            user.password_hash = "";  // 验证码登录没有密码
+            
+            uint64_t new_user_id;
+            if (!user_dao.createUser(user, new_user_id)) {
+                LOG_ERROR << "Failed to create user for email: " << email;
+                sendCommonResponse(conn, header, false, "Login failed");
+                return;
+            }
+            user.user_id = new_user_id;
+            LOG_INFO << "Auto created user for email: " << email;
+        }
+        
+        // 5. 生成 token
+        std::string token = TManager::getInstance().generateT(
+            user.user_id, 
+            user.username, 
+            device_id.empty() ? "unknown" : device_id, 
+            24  // 24小时有效
+        );
+        
+        // 6. 更新在线状态
+        user_dao.updateUserStatus(user.user_id, 1);
+        
+        // 7. 构造登录响应
+        p::LoginResponse response;
+        response.set_success(true);
+        response.set_token(token);
+        response.set_message("Login success");
+        response.set_uid(user.user_id);
+        response.set_nickname(user.nickname);
+        
+        p::MessageHeader resp_header;
+        resp_header.set_msg_id(header.msg_id() + 1);
+        resp_header.set_msg_type(p::MSG_LOGIN);
+        resp_header.set_timestamp(tool::getTimestamp());
+        
+        auto data = proto::MessageCodec::encode(resp_header, response);
+        if (!data.empty()) {
+            conn->send(data.data(), data.size());
+        }
+        
+        LOG_INFO << "User logged in via verification code: " << email 
+                 << " (uid=" << user.user_id << ")";
+    }
 
 
 private:
-    void sendCommonResponse(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, bool success, const std::string& msg)  {
+    void sendCommonResponse(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, bool success, const std::string& msg) {
+        LOG_INFO << "sendCommonResponse: success=" << success << ", msg=" << msg;
+        
         p::CommonResponse response;
         response.set_code(success ? 0 : -1);
         response.set_message(msg);
@@ -223,51 +427,34 @@ private:
 
         p::MessageHeader resp_header;
         resp_header.set_msg_id(header.msg_id() + 1);
-        resp_header.set_msg_type(header.msg_type());
+        resp_header.set_msg_type(p::MSG_COMMON_RESPONSE);
         resp_header.set_timestamp(tool::getTimestamp());
-    
+        
+        LOG_INFO << "sendCommonResponse: encoding...";
+        
         auto data = proto::MessageCodec::encode(resp_header, response);
-        if(!data.empty()) {
+        if (!data.empty()) {
+            LOG_INFO << "sendCommonResponse: sending " << data.size() << " bytes";
             conn->send(data.data(), data.size());
+            LOG_INFO << "sendCommonResponse: sent";
+        } else {
+            LOG_ERROR << "sendCommonResponse: encode failed";
         }
     }
 
     // 检验名称
     bool validateUsername(const std::string& username) {
-        if(username.length() < 3 || username.length() > 20) {
-            return false;
-        }
-
-        std::regex pattern("^[a-zA-Z0-9]+$");
-        return std::regex_match(username, pattern);
+        return InputValidator::validateUsername(username);
     }
 
     // 检验邮箱
     bool validataEmail(const std::string& email) {
-        if(email.empty()) {
-            return true;
-        }
-        std::regex pattern(R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})");
-
-        return std::regex_match(email, pattern);
+        return InputValidator::validateEmail(email);
     }
 
     // 检查密码
     bool validataPassword(const std::string& password) {
-        if(password.length() < 8) {
-            return false;
-        }
-        bool has_letter = false, has_digit = false;
-        for(char c : password) {
-            if(isdigit(c)) {
-                has_digit = true;
-            }
-            if(isalpha(c)) {
-                has_letter = true;
-            }
-        }
-
-        return has_letter && has_digit;
+        return InputValidator::validatePassword(password);
     }
 
 };
