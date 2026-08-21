@@ -6,10 +6,13 @@
 #include <atomic>
 #include <getopt.h>
 #include <csignal>
+#include <deque>
 
 static std::unique_ptr<ChatClient> client;
 static std::unique_ptr<cUI> ui;
 static std::atomic<bool> running(true);
+static std::deque<std::string> pending_messages;
+static std::mutex pending_mutex;
 
 static std::vector<std::string> CommandParser(const std::string& cmd) {
     std::vector<std::string> parts;
@@ -31,10 +34,7 @@ void commandHandle(const std::string& cmd) {
         running = false;
         return ;
     }
-    else if(cmd == "/clear" || cmd == "clear") {
-        ui->clearScreen();
-        ui->displaySystem("清空");
-    }
+    
 
     auto parts = CommandParser(cmd);
     if(parts.empty()) {
@@ -119,26 +119,35 @@ void commandHandle(const std::string& cmd) {
                     join_type = std::stoi(parts[idx]);
                     idx++;
                 }
-                catch(...) {
+                catch(...) {}
+            }
 
-                }
+            uint64_t my_uid = client->getUserId();
+            if (my_uid == 0) {
+                ui->displayError("请先登录");
+                return;
             }
 
             for(size_t i = idx; i < parts.size(); ++i) {
                 try {
                     uint64_t uid = std::stoull(parts[i]);
+                    // 过滤掉群主自己
+                    if (uid == my_uid) {
+                        LOG_INFO << "跳过自己的ID: " << uid;
+                        continue;
+                    }
+                    LOG_INFO << "添加成员: " << uid;
                     member_ids.push_back(uid);
                 }
                 catch(const std::exception& e) {
                     ui->displayError("无效的成员ID： " + parts[i]);
-                    return ;
+                    return;
                 }
             }
 
             if(member_ids.size() < 2) {
-                ui->displayError("人数少于三人，创建群聊");
-                ui->displayError("除自己外，至少添加两个用户");
-                return ;
+                ui->displayError("除自己外，至少需要2个其他成员才能创建群聊");
+                return;
             }
 
             client->creatgroup(name, desc, is_public, join_type, member_ids);
@@ -204,13 +213,26 @@ void commandHandle(const std::string& cmd) {
         }
         else if(parts[0] == "/offline_files") {
             client->getOfflineFiles();
-        } 
+        }
+        else if(parts[0] == "/clear" || parts[0] == "clear") {
+            ui->clearScreen();
+            ui->displaySystem("清空");
+        }
         else {
             ui->displayError("未知命令");
         }
     }
     catch (const std::exception& e) {
         ui->displayError("参数错误: " + std::string(e.what()));
+    }
+    std::deque<std::string> messages;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        messages.swap(pending_messages);
+    }
+    while (!messages.empty()) {
+        ui->displayMessage(messages.front());
+        messages.pop_front();
     }
 }
 
@@ -263,12 +285,23 @@ int main(int argc, char* argv[]) {
 
     client = std::make_unique<ChatClient>();
     client->setMessageCallback([&](const std::string& msg) {
-        ui->displayMessage(msg);
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        pending_messages.push_back(msg);
     });
 
     if(!client->connect(host, port, use_tls, cert_file, key_file)) {
         ui->displayError("服务器链接失败，请检查");
-        ui->run([](const std::string&) {});
+        ui->run([](const std::string&) {}, [] {
+            std::deque<std::string> messages;
+            {
+                std::lock_guard<std::mutex> lock(pending_mutex);
+                messages.swap(pending_messages);
+            }
+            while (!messages.empty()) {
+                ui->displayMessage(messages.front());
+                messages.pop_front();
+            }
+        });
         return 1;
     }
 
@@ -277,7 +310,18 @@ int main(int argc, char* argv[]) {
         ui->displaySystem("TLS加密已启动");
     }
 
-    ui->run(commandHandle);
+    ui->run(commandHandle,[] {
+            std::deque<std::string> messages;
+            {
+                std::lock_guard<std::mutex> lock(pending_mutex);
+                messages.swap(pending_messages);
+            }
+            while (!messages.empty()) {
+                ui->displayMessage(messages.front());
+                messages.pop_front();
+            }
+        }
+    );
     client->disconnect();
     return 0;
 }
