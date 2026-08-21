@@ -111,7 +111,7 @@ public:
         timeout_thread_ = std::thread([this]() {
             while(running_) {
                 std::this_thread::sleep_for(std::chrono::seconds(10));
-                OnlineManager::getInstance().checkTimeout(45);
+                OnlineManager::getInstance().checkTimeout(90);
             }
         });
 
@@ -601,13 +601,14 @@ private:
 
         p::LoginResponse response;
         if (found && Crypot::verifyPassword(request.password(), user.salt, user.password_hash)) {
+            OnlineManager::getInstance().removeUser(user.user_id);
             auto existing_conn = getConnectionByUser(user.user_id);
-            if(existing_conn && !existing_conn->isClosed()) {
-                LOG_INFO << "User" << user.username << "already has connection, close old one";
+            if(existing_conn && existing_conn != conn && !existing_conn->isClosed()) {
+                LOG_INFO << "User " << user.username << " has another connection, closing old one";
                 existing_conn->handleClose();
+                removeUserConnection(user.user_id);
             }
             
-            OnlineManager::getInstance().removeUser(user.user_id);
 
             std::string device_id = request.device_id().empty() ? "unknown" : request.device_id();
             std::string token = TManager::getInstance().generateT(

@@ -155,6 +155,10 @@ public:
         }
     }
 
+    void updateActivityTime() {
+        last_active_time = std::chrono::steady_clock::now();
+    }
+
     Buffer& inputBuffer() {
         return input_buffer;
     }
@@ -189,6 +193,7 @@ public:
 
     void handleRead() {
         LOG_INFO << "handle read called";
+        last_active_time = std::chrono::steady_clock::now();
         char buf[1024 * 64];
         while(true) {
             ssize_t n;
@@ -216,6 +221,7 @@ public:
 
             if (n > 0) {
                 input_buffer.Append(buf, n);
+                last_active_time = std::chrono::steady_clock::now();
             } else if (n == 0) {
                 LOG_INFO << "Connected closed by :fd:" << fd_;
                 handleClose();
@@ -236,6 +242,8 @@ public:
     }
 
     void handleWrite() {
+        last_active_time = std::chrono::steady_clock::now();
+
         while (output_buffer.readBytes() > 0) {
             ssize_t n;
             if (use_tls_ && tls_socket_ && tls_handshaked_) {
@@ -245,6 +253,7 @@ public:
             }
             if (n > 0) {
                 output_buffer.costBytes(n);
+                last_active_time = std::chrono::steady_clock::now();
             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {

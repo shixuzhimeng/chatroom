@@ -81,12 +81,16 @@ public:
     void addConnection(int fd) override {
         LOG_INFO << "subadd connection";
         
+
+
         if(fd < 0) {
             LOG_ERROR << "Invalid fd: " << fd;
             return ;
         }
         
         auto conn = std::make_shared<TcpConnection>(fd);
+        conn->updateActivityTime();
+
         // 使用 weak_ptr 避免循环引用
         std::weak_ptr<SubReactor> weak_self = shared_from_this();
         conn->setMessageCallback([weak_self](ConnectionPtr c, Buffer& buf) {
