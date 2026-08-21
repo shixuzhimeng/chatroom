@@ -33,13 +33,13 @@ public:
         p::GroupChatRequest request;
         if(!request.ParseFromArray(body.data(), body.size())) {
             sendGroupChatResponse(conn, header, false, "Invalid request");
-            return ;
+            return;
         }
 
         uint64_t from_uid = conn->getUserID();
         if(from_uid == 0) {
-            sendGroupChatResponse(conn, header, false, "Uesr not logged in");
-            return ;
+            sendGroupChatResponse(conn, header, false, "User not logged in");
+            return;
         }
 
         uint64_t group_id = request.group_id();
@@ -49,7 +49,7 @@ public:
         // 验证是否为群组成员
         if(!group_dao_->isGroupMember(group_id, from_uid)) {
             sendGroupChatResponse(conn, header, false, "Not a member of this group");
-            return ;
+            return;
         }
 
         // 检查是否被禁言
@@ -57,7 +57,7 @@ public:
         if(group_dao_->getMember(group_id, from_uid, member) && member.is_muted) {
             if(member.muted_until > tool::getTimestamp()) {
                 sendGroupChatResponse(conn, header, false, "You are muted");
-                return ;
+                return;
             }
         }
 
@@ -75,7 +75,18 @@ public:
         uint64_t msg_id;
         if(!dao.saveGroupMessage(msg, msg_id)) {
             sendGroupChatResponse(conn, header, false, "failed to save message");
-            return ;
+            return;
+        }
+
+        // 获取发送者用户名
+        std::string sender_username;
+        UserDAO user_dao;
+        USER user;
+        if (user_dao.getUserByID(from_uid, user)) {
+            sender_username = user.nickname.empty() ? user.username : user.nickname;
+        }
+        if (sender_username.empty()) {
+            sender_username = std::to_string(from_uid);
         }
 
         // 获取详细的成员列表
@@ -83,58 +94,96 @@ public:
 
         MessageDeduplicator& dedup = MessageDeduplicator::getInstance();
         if(dedup.isDuplicate(msg_id)) {
-            LOG_ERROR << "Duplicate group message deceted, msg_id=" << msg_id << ", group_id=" << group_id << ", from=" << from_uid;
+            LOG_ERROR << "Duplicate group message detected, msg_id=" << msg_id << ", group_id=" << group_id << ", from=" << from_uid;
             sendSuccessResponse(conn, header, msg_id);
-            return ;
+            return;
         }
         dedup.markProcessed(msg_id);
 
-        // 将消息发送给在线的成员
-        p::GroupMessagePush push_msg;
-        push_msg.set_msg_id(msg_id);
-        push_msg.set_msg_type(msg_type);
-        push_msg.set_group_id(group_id);
-        push_msg.set_from_uid(from_uid);
-        push_msg.set_content(content);
-        push_msg.set_from_username(member.username);
-        push_msg.set_created_at(tool::getTimestamp());
+        {
+            // 构建推送消息
+            p::GroupMessagePush push_msg;
+            push_msg.set_msg_id(msg_id);
+            push_msg.set_msg_type(msg_type);
+            push_msg.set_group_id(group_id);
+            push_msg.set_from_uid(from_uid);
+            push_msg.set_content(content);
+            push_msg.set_from_username(sender_username);
+            push_msg.set_created_at(tool::getTimestamp());
 
-        std::vector<uint64_t> offline_members;
+            LOG_INFO << "=== DEBUG: GroupMessagePush fields ===";
+            LOG_INFO << "msg_id: " << push_msg.msg_id();
+            LOG_INFO << "group_id: " << push_msg.group_id();
+            LOG_INFO << "from_uid: " << push_msg.from_uid();
+            LOG_INFO << "from_username: " << push_msg.from_username();
+            LOG_INFO << "content: " << push_msg.content();
+            LOG_INFO << "msg_type: " << push_msg.msg_type();
+            LOG_INFO << "created_at: " << push_msg.created_at();
 
-        for(const auto& m : members) {
-            if(m.user_id != from_uid) {
-                bool is_oline = false;
+            std::string test_serialized;
+            if (push_msg.SerializeToString(&test_serialized)) {
+                LOG_INFO << "SerializeToString size: " << test_serialized.size();
+                std::string hex;
+                for (size_t i = 0; i < std::min(test_serialized.size(), size_t(50)); ++i) {
+                    char buf[4];
+                    snprintf(buf, sizeof(buf), "%02x ", (unsigned char)test_serialized[i]);
+                    hex += buf;
+                }
+                LOG_INFO << "Serialized hex: " << hex;
+            } else {
+                LOG_ERROR << "SerializeToString failed!";
+            }
+
+            std::vector<uint64_t> offline_members;
+
+            // 发送给所有在线成员
+            for(const auto& m : members) {
+                
+                if(m.user_id == from_uid) {
+                    LOG_DEBUG << "Skip sender " << from_uid << " for broadcast";
+                    continue;
+                }
+
+                bool is_online = false;
                 if(user_connections_) {
                     auto it = user_connections_->find(m.user_id);
                     if(it != user_connections_->end()) {
-                        is_oline = true;
+                        is_online = true;
+                        
                         p::MessageHeader push_header;
                         push_header.set_msg_id(msg_id);
-                        push_header.set_msg_type(p::MSG_GROUP_PUSH);
+                        push_header.set_msg_type(p::MSG_GROUP_CHAT);
                         push_header.set_from_uid(from_uid);
                         push_header.set_to_uid(group_id);
                         push_header.set_timestamp(tool::getTimestamp());
                     
+                        LOG_INFO << "Sending GroupMessagePush to user " << m.user_id;
                         auto data = proto::MessageCodec::encode(push_header, push_msg);
                         if(!data.empty()) {
                             it->second->send(data.data(), data.size());
+                            LOG_INFO << "Sent to user " << m.user_id << ", data size: " << data.size();
                         }
                     }
                 }
 
-                if(!is_oline) {
+                if(!is_online) {
                     offline_members.push_back(m.user_id);
                 }
             }
+
+            // 保存离线消息
+            for(uint64_t uid : offline_members) {
+                if(uid != from_uid) {  // 确保不保存发送者自己的离线消息
+                    dao.saveGroupOfflineMessage(uid, group_id, msg_id);
+                }
+            }
+
+            LOG_INFO << "Group message " << msg_id << " sent to " << members.size() 
+                    << " members, " << offline_members.size() << " offline";
         }
 
-        // 保存消息
-        for(uint64_t uid : offline_members) {
-            dao.saveGroupOfflineMessage(uid, group_id, msg_id);
-        }
-
+        // 最后发送响应给发送者（在这个作用域外，push_msg 已经被销毁）
         sendGroupChatResponse(conn, header, true, "Message sent");
-        LOG_INFO << "Group message " << msg_id << " sent to " << members.size() << " members, " << offline_members.size() << " offline";
     }
 
     // 获取群组历史消息
@@ -183,7 +232,7 @@ public:
             item->set_from_username(msg.from_username);
             item->set_content(msg.content);
             item->set_is_recalled(msg.is_recalled);
-            item->set_created_at(tool::getTimestamp());
+            item->set_created_at(msg.created_at);
         }
 
         sendGroupHistoryResponse(conn, header, response);
@@ -340,12 +389,32 @@ public:
 
         auto conn = getConnection(user_id);
         if(!conn || conn->isClosed()) {
-            LOG_ERROR << "User " << user_id << " not oline, cannot send offline messages";
+            LOG_ERROR << "User " << user_id << " not online, cannot send offline messages";
             return ;
         }
 
         // 发送群聊的离线消息
-        for(const auto& msg : group_msgs) {
+        for(auto& msg : group_msgs) {
+            if (msg.from_uid == 0 && !msg.extra.empty()) {
+                db::GroupMessageExtra extra;
+                if (Switch::dsFromJson(msg.extra, extra)) {
+                    msg.from_uid = extra.from_uid();
+                    msg.content = extra.content();
+                    msg.msg_type = extra.msg_type();
+                    msg.group_id = extra.group_id();
+                    msg.created_at = extra.created_at();
+                    LOG_DEBUG << "Recovered from extra: from_uid=" << msg.from_uid 
+                            << ", content=" << msg.content;
+                }
+            }
+
+            // 如果恢复后还是空，跳过
+            if (msg.from_uid == 0 || msg.content.empty()) {
+                LOG_ERROR << "Skipping invalid offline msg: from_uid=" << msg.from_uid 
+                        << ", content=" << msg.content;
+                continue;
+            }
+
             p::GroupMessagePush push_msg;
             push_msg.set_msg_id(msg.msg_id);
             push_msg.set_msg_type(msg.msg_type);
@@ -357,7 +426,7 @@ public:
         
             p::MessageHeader header;
             header.set_msg_id(msg.msg_id);
-            header.set_msg_type(p::MSG_GROUP_PUSH);
+            header.set_msg_type(p::MSG_GROUP_CHAT);
             header.set_timestamp(tool::getTimestamp());
             header.set_from_uid(msg.from_uid);
             header.set_to_uid(msg.group_id);
@@ -394,7 +463,7 @@ private:
 
         p::MessageHeader resp_header;
         resp_header.set_msg_id(header.msg_id() + 1);
-        resp_header.set_msg_type(header.msg_type());
+        resp_header.set_msg_type(p::MSG_COMMON_RESPONSE);
         resp_header.set_timestamp(tool::getTimestamp());
         
         auto data = proto::MessageCodec::encode(resp_header, response);

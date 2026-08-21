@@ -415,7 +415,7 @@ public:
             // 获取最后一条消息内容
             std::string msg_sql = "SELECT content, msg_type FROM messages WHERE msg_id = " + std::to_string(info.last_msg_id);
             std::vector<std::map<std::string, std::string>> msg_result;
-            if(!executeQuery(msg_sql, msg_result) && ! msg_result.empty()) {
+            if(executeQuery(msg_sql, msg_result) && ! msg_result.empty()) {
                 int msg_type = std::stoi(msg_result[0]["msg_type"]);
                 if(msg_type == 1) {
                     info.last_msg_content = msg_result[0]["content"];
@@ -489,6 +489,21 @@ private:
         msg.created_at = std::stoll(row.at("created_at"));
         msg.delivered_at = std::stoll(row.at("delivered_at"));
         msg.read_at = std::stoll(row.at("read_at"));
+
+        auto it_delivered = row.find("delivered_at");
+        msg.delivered_at = (it_delivered != row.end() && !it_delivered->second.empty()) 
+                        ? std::stoll(it_delivered->second) : 0;
+        
+        auto it_read = row.find("read_at");
+        msg.read_at = (it_read != row.end() && !it_read->second.empty()) 
+                    ? std::stoll(it_read->second) : 0;
+
+        auto it_recalled = row.find("recalled_at");
+        if (it_recalled != row.end() && !it_recalled->second.empty()) {
+            msg.recalled_at = std::stoll(it_recalled->second);
+        } else {
+            msg.recalled_at = 0;
+        }
     }
 
     std::string getMessageTypeName(int type) {

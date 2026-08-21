@@ -47,6 +47,8 @@ public:
             LOG_ERROR << "Private key does not match certificate";
             return false;
         }
+
+        return true;
     }
 
     SSL_CTX* get() const { return ctx_; }

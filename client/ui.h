@@ -1,320 +1,637 @@
 #pragma once
 
-#include <ncurses.h>
-#include <functional>
+#include <ncursesw/curses.h>
+
+#include <algorithm>
+#include <codecvt>
+#include <cwchar>
 #include <deque>
+#include <functional>
+#include <locale>
 #include <mutex>
 #include <string>
-#include <locale.h>
-#include <curses.h>
-#include <codecvt>
+#include <vector>
 
 class cUI {
 public:
-    cUI() : msg_win_(nullptr), input_win_(nullptr), status_win_(nullptr) {}
+    cUI()
+        : msg_win_(nullptr),
+          input_win_(nullptr),
+          status_win_(nullptr),
+          running_(false),
+          msg_scroll_(0),
+          input_cursor_(0) {
+    }
+
     ~cUI() {
-        if (msg_win_) delwin(msg_win_);
-        if (input_win_) delwin(input_win_);
-        if (status_win_) delwin(status_win_);
+        if (msg_win_)
+            delwin(msg_win_);
+
+        if (input_win_)
+            delwin(input_win_);
+
+        if (status_win_)
+            delwin(status_win_);
+
         endwin();
     }
 
     bool UIinit() {
-        setlocale(LC_ALL, "");   
-        initscr();
+        setlocale(LC_ALL, "");
+
+        if (initscr() == nullptr)
+            return false;
+
         cbreak();
         noecho();
         keypad(stdscr, TRUE);
+
         curs_set(1);
-        refresh();
 
         int h, w;
         getmaxyx(stdscr, h, w);
 
-        int status_h = 1;
-        int input_h = 3;
-        int msg_h = h - status_h - input_h;
+        if (h < 8 || w < 20) {
+            endwin();
+            return false;
+        }
+
+        const int status_h = 1;
+        const int input_h = 5;
+        const int msg_h = h - status_h - input_h;
 
         status_win_ = newwin(status_h, w, 0, 0);
         msg_win_ = newwin(msg_h, w, status_h, 0);
-        input_win_ = newwin(input_h, w, status_h + msg_h, 0);
+        input_win_ = newwin(
+            input_h,
+            w,
+            status_h + msg_h,
+            0
+        );
 
-        // 启用滚动
-        scrollok(msg_win_, TRUE);
+        if (!status_win_ || !msg_win_ || !input_win_)
+            return false;
+
         keypad(input_win_, TRUE);
 
-        // 初始绘制
-        werase(status_win_);
-        mvwprintw(status_win_, 0, 2, "Status: Connected");
-        wrefresh(status_win_);
+        scrollok(msg_win_, FALSE);
 
-        box(msg_win_, 0, 0);
-        wmove(msg_win_, 1, 2);  // 移动光标到第一行
-        wrefresh(msg_win_);
+        drawStatus();
+        redrawMessages();
+        redrawInput();
 
-        box(input_win_, 0, 0);
-        mvwprintw(input_win_, 1, 2, "> ");
-        wmove(input_win_, 1, 4);
-        wrefresh(input_win_);
+        refresh();
+
+        running_ = true;
 
         return true;
     }
 
     void setStatus(const std::string& text) {
-        if (!status_win_) return;
+        if (!status_win_)
+            return;
+
+        std::lock_guard<std::mutex> lock(ui_mutex_);
+
         werase(status_win_);
-        mvwprintw(status_win_, 0, 2, "%s", text.c_str());
+
+        int w = getmaxx(status_win_);
+
+        mvwprintw(
+            status_win_,
+            0,
+            1,
+            "%.*s",
+            std::max(0, w - 2),
+            text.c_str()
+        );
+
         wrefresh(status_win_);
     }
 
     void displayMessage(const std::string& msg) {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            lines_.push_back(msg);
-            if (lines_.size() > MAX_LINES) {
-                lines_.pop_front();
+            std::lock_guard<std::mutex> lock(message_mutex_);
+
+            messages_.push_back(msg);
+
+            if (messages_.size() > MAX_MESSAGES) {
+                messages_.pop_front();
             }
+
+            msg_scroll_ = 0;
         }
-        appendMessageToWindow(msg);
+
+        redrawMessages();
+        redrawInput();
     }
 
-    void displaySystem(const std::string& msg) { displayMessage("[系统] " + msg); }
-    void displayError(const std::string& msg)   { displayMessage("[错误] " + msg); }
+    void displaySystem(const std::string& msg) {
+        displayMessage("[系统] " + msg);
+    }
 
-    std::string getInput() {
-        werase(input_win_);
-        box(input_win_, 0, 0);
+    void displayError(const std::string& msg) {
+        displayMessage("[错误] " + msg);
+    }
 
-        mvwprintw(input_win_, 1, 2, "> ");
-        wmove(input_win_, 1, 4);
+    std::string getInput(std::function<void()> processMessages = nullptr) {
+        if (!input_win_)
+            return "";
 
-        noecho();
+        nodelay(input_win_, TRUE);
 
-        std::wstring winput;
-        wint_t ch;
+        std::wstring input;
+        size_t cursor = 0;
 
-        while (true) {
+        while (running_) {
+            if (processMessages) {
+                processMessages();
+            }
+
+            redrawInput(input, cursor);
+
+            wint_t ch;
             int ret = wget_wch(input_win_, &ch);
 
-            if (ret == ERR)
+            if (ret == ERR) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
                 continue;
+            }
 
             if (ret == OK) {
+                // Enter
                 if (ch == L'\n' || ch == L'\r') {
                     break;
                 }
-
+                // Backspace
                 if (ch == 127 || ch == 8) {
-                    if (!winput.empty()) {
-                        winput.pop_back();
 
-                        int y, x;
-                        getyx(input_win_, y, x);
-
-                        if (x > 4) {
-                            wmove(input_win_, y, x - 1);
-                            wdelch(input_win_);
-                        }
+                    if (cursor > 0) {
+                        input.erase(cursor - 1, 1);
+                        --cursor;
                     }
-                }
-                else if (ch >= 32) {
-                    winput.push_back(static_cast<wchar_t>(ch));
 
-                    wchar_t wc = static_cast<wchar_t>(ch);
-                    waddnwstr(input_win_, &wc, 1);
+                    continue;
                 }
-            }
-            else if (ret == KEY_CODE_YES) {
-                if (ch == KEY_BACKSPACE) {
-                    if (!winput.empty()) {
-                        winput.pop_back();
+                // 可打印字符
+                if (iswprint(ch)) {
+                    input.insert(
+                        input.begin() + cursor,
+                        static_cast<wchar_t>(ch)
+                    );
 
-                        int y, x;
-                        getyx(input_win_, y, x);
-
-                        if (x > 4) {
-                            wmove(input_win_, y, x - 1);
-                            wdelch(input_win_);
-                        }
-                    }
+                    ++cursor;
                 }
+
+                continue;
             }
 
-            wrefresh(input_win_);
+            if (ret == KEY_CODE_YES) {
+
+                switch (ch) {
+
+                case KEY_BACKSPACE:
+                    if (cursor > 0) {
+                        input.erase(cursor - 1, 1);
+                        --cursor;
+                    }
+                    break;
+
+                case KEY_LEFT:
+                    if (cursor > 0)
+                        --cursor;
+                    break;
+
+                case KEY_RIGHT:
+                    if (cursor < input.size())
+                        ++cursor;
+                    break;
+
+                case KEY_HOME:
+                    cursor = 0;
+                    break;
+
+                case KEY_END:
+                    cursor = input.size();
+                    break;
+
+                default:
+                    break;
+                }
+            }
         }
 
-        wrefresh(input_win_);
+        redrawInput();
+        nodelay(input_win_, FALSE);
+        return wideToUtf8(input);
+    }
 
-        if (winput.empty())
-            return "";
+    void run(std::function<void(const std::string&)> handler, std::function<void()> processMessages) {
+        if (!handler)
+            return;
 
-        size_t len = wcstombs(nullptr, winput.c_str(), 0);
+        running_ = true;
 
-        if (len == static_cast<size_t>(-1))
-            return "";
+        while (running_) {
+            if(processMessages) {
+                processMessages();
+            }
 
-        std::string result(len, '\0');
+            std::string input = getInput();
+            if (input.empty()) {
+                continue;
+            }
+            if (input == "/quit" || input == "exit") {
+                running_ = false;
+                break;
+            }
+            if(handler) {
+                handler(input);
+            }
+        }
+    }
 
-        wcstombs(&result[0], winput.c_str(), len);
-
-        return result;
+    void stop() {
+        running_ = false;
     }
 
     void refresh() {
-        wrefresh(status_win_);
-        wrefresh(input_win_);
-        wrefresh(msg_win_);
-    }
+        if (!status_win_ ||
+            !msg_win_ ||
+            !input_win_)
+            return;
 
-    void run(std::function<void(const std::string&)> handler) {
-        while (true) {
-            refresh();
-            std::string input = getInput();
-            if (input == "/quit" || input == "exit") break;
-            if (!input.empty()) handler(input);
-        }
+        redrawStatus();
+        redrawMessages();
+        redrawInput();
     }
 
     void clearScreen() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        lines_.clear();
-        if (msg_win_) {
-            werase(msg_win_);
-            box(msg_win_, 0, 0);
-            wmove(msg_win_, 1, 2);
-            wrefresh(msg_win_);
+        {
+            std::lock_guard<std::mutex> lock(message_mutex_);
+
+            messages_.clear();
+            msg_scroll_ = 0;
         }
+
+        redrawMessages();
     }
 
 private:
     WINDOW* msg_win_;
     WINDOW* input_win_;
     WINDOW* status_win_;
-    std::deque<std::string> lines_;
-    std::mutex mutex_;
-    static const int MAX_LINES = 1000;
+    std::deque<std::string> messages_;
 
-    // ✅ 稳定的消息追加函数
-    void appendMessageToWindow(const std::string& msg) {
-        if (!msg_win_) return;
-        
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        int max_y = getmaxy(msg_win_) - 1;
-        int max_x = getmaxx(msg_win_) - 4;
-        int content_height = max_y - 2;  // 减去上下边框
-        
-        if (content_height <= 0) return;
-        
-        // ✅ 获取当前光标位置
-        int cur_y, cur_x;
-        getyx(msg_win_, cur_y, cur_x);
-        
-        // ✅ 如果光标在边框或无效位置，重置到第一行
-        if (cur_y <= 0 || cur_y >= max_y) {
-            cur_y = 1;
-            cur_x = 2;
-            wmove(msg_win_, cur_y, cur_x);
-        }
-        
-        // ✅ 将消息按行分割
-        std::vector<std::string> lines = splitMessage(msg, max_x);
-        
-        for (const std::string& line : lines) {
-            // ✅ 检查是否需要换行或滚动
-            if (cur_y >= max_y - 1) {
-                // 窗口满了，向上滚动一行
-                wscrl(msg_win_, 1);
-                // 移动到最后一行
-                cur_y = max_y - 1;
-                cur_x = 2;
-                wmove(msg_win_, cur_y, cur_x);
-                // 清空最后一行
-                wclrtoeol(msg_win_);
-            } else {
-                // 检查当前行是否还有空间
-                if (cur_x > 2) {
-                    // 当前行已有内容，换到下一行
-                    cur_y++;
-                    cur_x = 2;
-                    wmove(msg_win_, cur_y, cur_x);
-                }
+    mutable std::mutex message_mutex_;
+    mutable std::mutex ui_mutex_;
+
+    bool running_;
+
+    int msg_scroll_;
+    size_t input_cursor_;
+    static constexpr size_t MAX_MESSAGES = 1000;
+
+    std::wstring utf8ToWide(const std::string& str) {
+        std::wstring result;
+
+        mbstate_t state{};
+        const char* src = str.data();
+
+        size_t len = str.size();
+
+        while (len > 0) {
+
+            wchar_t wc;
+
+            size_t ret = mbrtowc(
+                &wc,
+                src,
+                len,
+                &state
+            );
+
+            if (ret == static_cast<size_t>(-1)) {
+                // 非法 UTF-8
+                result.push_back(L'?');
+                ++src;
+                --len;
+                state = mbstate_t{};
+                continue;
             }
-            
-            // 打印消息行
-            mvwprintw(msg_win_, cur_y, cur_x, "%s", line.c_str());
-            
-            // 更新光标位置
-            cur_x += line.length();
-            wmove(msg_win_, cur_y, cur_x);
-        }
-        
-        wrefresh(msg_win_);
-    }
-    
-    // 将长消息分割成多行
-    std::vector<std::string> splitMessage(const std::string& msg, int max_width) {
-        std::vector<std::string> result;
-        std::string remaining = msg;
-        
-        while (!remaining.empty()) {
-            if (static_cast<int>(remaining.length()) <= max_width) {
-                result.push_back(remaining);
+
+            if (ret == static_cast<size_t>(-2)) {
                 break;
             }
-            
-            // ✅ 尝试在空格处断开
-            size_t cut_pos = remaining.find_last_of(' ', max_width);
-            if (cut_pos == std::string::npos || cut_pos == 0) {
-                cut_pos = max_width;
-            } else {
-                // 保持单词完整，但不要切掉空格
-                cut_pos = cut_pos + 1;
+
+            if (ret == 0) {
+                break;
             }
-            
-            result.push_back(remaining.substr(0, cut_pos));
-            remaining = remaining.substr(cut_pos);
-            
-            // 去除行首空格
-            if (!remaining.empty() && remaining[0] == ' ') {
-                remaining = remaining.substr(1);
-            }
+
+            result.push_back(wc);
+
+            src += ret;
+            len -= ret;
         }
-        
+
         return result;
     }
 
-    // 完整重绘
-    void redrawAll() {
-        if (!msg_win_) return;
-        std::lock_guard<std::mutex> lock(mutex_);
-        
+    std::string wideToUtf8(const std::wstring& str) {
+        std::string result;
+
+        mbstate_t state{};
+
+        char buffer[MB_LEN_MAX];
+
+        for (wchar_t wc : str) {
+
+            size_t ret = wcrtomb(
+                buffer,
+                wc,
+                &state
+            );
+
+            if (ret == static_cast<size_t>(-1)) {
+                result += '?';
+                state = mbstate_t{};
+                continue;
+            }
+
+            result.append(buffer, ret);
+        }
+
+        return result;
+    }
+
+    int charWidth(wchar_t wc) {
+        int width = wcwidth(wc);
+
+        if (width < 0)
+            return 0;
+
+        return width;
+    }
+
+    std::vector<std::wstring>
+    wrapText(
+        const std::wstring& text,
+        int max_width
+    ) {
+        std::vector<std::wstring> result;
+
+        if (max_width <= 0)
+            return result;
+
+        std::wstring current;
+        int current_width = 0;
+
+        for(wchar_t wc : text) {
+            if (wc == L'\n') {
+                result.push_back(current);
+
+                current.clear();
+                current_width = 0;
+
+                continue;
+            }
+
+            int width = charWidth(wc);
+
+            if (current_width + width > max_width) {
+
+                result.push_back(current);
+
+                current.clear();
+                current_width = 0;
+            }
+
+            current.push_back(wc);
+            current_width += width;
+        }
+
+        if (!current.empty() || result.empty()) {
+            result.push_back(current);
+        }
+
+        return result;
+    }
+
+
+    std::vector<std::wstring>
+    buildDisplayLines(int width) {
+
+        std::vector<std::wstring> result;
+
+        std::lock_guard<std::mutex> lock(message_mutex_);
+
+        for (const auto& msg : messages_) {
+
+            std::wstring wmsg =
+                utf8ToWide(msg);
+
+            auto lines =
+                wrapText(wmsg, width);
+
+            result.insert(
+                result.end(),
+                lines.begin(),
+                lines.end()
+            );
+        }
+
+        return result;
+    }
+
+    void drawStatus() {
+        if (!status_win_)
+            return;
+
+        werase(status_win_);
+
+        int width =
+            getmaxx(status_win_);
+
+        mvwprintw(
+            status_win_,
+            0,
+            1,
+            "%.*s",
+            std::max(0, width - 2),
+            "Status: Connected"
+        );
+
+        wrefresh(status_win_);
+    }
+
+    void redrawStatus() {
+        std::lock_guard<std::mutex> lock(ui_mutex_);
+
+        drawStatus();
+    }
+
+    void redrawMessages() {
+
+        if (!msg_win_)
+            return;
+
+        std::lock_guard<std::mutex> ui_lock(ui_mutex_);
+
+        int height =
+            getmaxy(msg_win_);
+
+        int width =
+            getmaxx(msg_win_);
+
+        int content_width =
+            width - 4;
+
+        int content_height =
+            height - 2;
+
+        if (content_width <= 0 ||
+            content_height <= 0)
+            return;
+
+        auto display_lines =
+            buildDisplayLines(content_width);
+
         werase(msg_win_);
+
         box(msg_win_, 0, 0);
 
-        int max_y = getmaxy(msg_win_) - 1;
-        int max_x = getmaxx(msg_win_) - 4;
-        if(max_x < 10) {
-            max_x = 10;
-        }
-        
-        int display_lines = max_y - 2;
-        if (display_lines <= 0) return;
-        
-        size_t start = 0;
-        if (lines_.size() > static_cast<size_t>(display_lines)) {
-            start = lines_.size() - display_lines;
+        if (display_lines.empty()) {
+            wrefresh(msg_win_);
+            return;
         }
 
-        int y = 1;
-        for (size_t i = start; i < lines_.size() && y < max_y; ++i) {
-            std::string line = lines_[i];
-            if (static_cast<int>(line.length()) > max_x) {
-                line = line.substr(0, max_x - 3) + "...";
-            }
-            mvwprintw(msg_win_, y, 2, "%-*s", max_x, " ");
-            mvwprintw(msg_win_, y++, 2, "%s", line.c_str());
+        int last = static_cast<int>(display_lines.size()) - 1;
+
+        int end_line = last - msg_scroll_;
+
+        if (end_line < 0)
+            end_line = 0;
+
+        int start_line =
+            end_line - content_height + 1;
+
+        if (start_line < 0)
+            start_line = 0;
+
+        for (int i = start_line;
+             i <= end_line &&
+             i < static_cast<int>(display_lines.size());
+             ++i) {
+
+            int y =
+                1 + (i - start_line);
+
+            mvwaddwstr(msg_win_, y, 2, display_lines[i].c_str());
         }
+
         wrefresh(msg_win_);
+    }
+
+    void redrawInput(const std::wstring& input, size_t cursor) {
+        if (!input_win_)
+            return;
+
+        std::lock_guard<std::mutex> lock(ui_mutex_);
+        werase(input_win_);
+        box(input_win_, 0, 0);
+        int height = getmaxy(input_win_);
+        int width = getmaxx(input_win_);
+        int content_width = width - 4;
+        if (content_width <= 0)
+            return;
+
+        std::vector<std::wstring> lines;
+        std::wstring current;
+
+        int current_width = 0;
+        int cursor_line = 0;
+        int cursor_column = 0;
+        size_t index = 0;
+
+        for(wchar_t wc : input) {
+            if(wc == L'\n') {
+                lines.push_back(current);
+                current.clear();
+                current_width = 0;
+                ++index;
+
+                if(index <= cursor) {
+                    ++cursor_line;
+                    cursor_column = 0;
+                }
+                continue;
+            }
+
+            int width_wc = charWidth(wc);
+            if(current_width + width_wc > content_width) {
+                lines.push_back(current);
+                current.clear();
+                current_width = 0;
+                ++cursor_line;
+                cursor_column = 0;
+            }
+
+            current.push_back(wc);
+            current_width += width_wc;
+
+            if (index < cursor) {
+                cursor_column += width_wc;
+            }
+
+            ++index;
+        }
+
+        lines.push_back(current);
+        cursor_line = 0;
+        cursor_column = 0;
+        int line_width = 0;
+
+        for(size_t i = 0; i < cursor; ++i) {
+            wchar_t wc = input[i];
+            if(wc == L'\n') {
+                ++cursor_line;
+                line_width = 0;
+                continue;
+            }
+
+            int cw = charWidth(wc);
+            if(line_width + cw > content_width) {
+                ++cursor_line;
+                line_width = 0;
+            }
+
+            line_width += cw;
+        }
+
+        cursor_column = line_width;
+
+        int visible_height = height - 2;
+        int first_line = 0;
+
+        if(cursor_line >= visible_height) {
+            first_line = cursor_line - visible_height + 1;
+        }
+        for(int i = first_line; i < static_cast<int>(lines.size()) && i < first_line + visible_height; ++i) {
+            mvwaddwstr(input_win_, 1 + i - first_line, 2, lines[i].c_str());
+        }
+
+        int screen_cursor_y = 1 + cursor_line - first_line;
+        int screen_cursor_x = 2 + cursor_column;
+
+        screen_cursor_y = std::clamp(screen_cursor_y, 1, height - 2);
+        screen_cursor_x = std::clamp(screen_cursor_x, 2, width - 2);
+
+        wmove(input_win_, screen_cursor_y, screen_cursor_x);
+
+        wrefresh(input_win_);
+    }
+
+    void redrawInput() {
+        redrawInput(L"", 0);
     }
 };

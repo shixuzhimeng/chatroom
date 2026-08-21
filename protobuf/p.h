@@ -24,6 +24,15 @@ public:
             return {};
         }
 
+        LOG_INFO << "MessageCodec::encode: body_str.size() = " << body_str.size();
+        std::string hex;
+        for (size_t i = 0; i < std::min(body_str.size(), size_t(50)); ++i) {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%02x ", (unsigned char)body_str[i]);
+            hex += buf;
+        }
+        LOG_INFO << "MessageCodec::encode: body_str hex = " << hex;
+
         p::MessageHeader h = header;
         h.set_body_length(body_str.size());
 
@@ -32,6 +41,8 @@ public:
             LOG_ERROR << "Failed to Serialize header";
             return {};
         }
+
+        LOG_INFO << "MessageCodec::encode: after header, body_str.size() = " << body_str.size();
         
         std::vector<char> result;
         uint32_t header_len = header_str.size();
@@ -163,15 +174,15 @@ public:
     }
 
     void Dispatcher(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
-        LOG_INFO << "Dispatcher: msg_type=" << header.msg_type();  // ← 添加这行
+        LOG_INFO << "Dispatcher: msg_type=" << header.msg_type();
         
         auto it = handles.find(header.msg_type());
 
         if(it != handles.end()) {
-            LOG_INFO << "Dispatcher: found handler for type " << header.msg_type();  // ← 添加这行
+            LOG_INFO << "Dispatcher: found handler for type " << header.msg_type();
             try {
                 it->second(conn, header, body);
-                LOG_INFO << "Dispatcher: handler executed successfully";  // ← 添加这行
+                LOG_INFO << "Dispatcher: handler executed successfully";
             }
             catch(const std::exception& e) {
                 LOG_ERROR << "Handle exception: " << e.what();

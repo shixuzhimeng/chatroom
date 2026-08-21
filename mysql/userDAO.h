@@ -90,6 +90,11 @@ public:
     }
 
     bool updateUserStatus(uint64_t user_id, int status) {
+        USER user;
+        if(getUserByID(user_id, user) && user.status == status) {
+            return true;
+        }
+        
         std::string sql = "UPDATE users SET status = " + std::to_string(status) + ", updated_at = " + std::to_string(tool::getTimestamp()) + " WHERE user_id = " + std::to_string(user_id);
         return executeUpdate(sql);
     }

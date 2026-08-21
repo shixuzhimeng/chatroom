@@ -171,22 +171,21 @@ public:
 
     // 删除群聊
     bool deleteGroup(uint64_t group_id) {
-        TransactionGuard tx(*this);
-        // 删除成员
+        // 先删除所有成员
         std::string del_member = "DELETE FROM group_members WHERE group_id = " + std::to_string(group_id);
         if(!executeUpdate(del_member)) {
-            LOG_ERROR << "Failed to delete group members";
+            LOG_ERROR << "Failed to delete group members for group " << group_id;
+            // 继续执行，尝试删除群组
+        }
+        
+        // 再删除群组
+        std::string del_group = "DELETE FROM `groups` WHERE group_id = " + std::to_string(group_id);
+        if(!executeUpdate(del_group)) {
+            LOG_ERROR << "Failed to delete group " << group_id;
             return false;
         }
         
-        // 删除群
-        std::string del_group = "DELETE FROM `groups` WHERE group_id = " + std::to_string(group_id);
-        if(!executeUpdate(del_group)) {
-            LOG_ERROR << "Failed to delete group";
-            return false;
-        }
-        LOG_INFO << "Group deleted: " << group_id; 
-        tx.commit();
+        LOG_INFO << "Group deleted: " << group_id;
         return true;
     }
 

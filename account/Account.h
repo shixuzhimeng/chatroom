@@ -114,7 +114,7 @@ public:
         
         std::string key = "logon_" + request.username();
         if(!LimiterManage::getInstance().getLoginLimit().isallow(key)) {
-            sendCommonResponse(conn, header, false, "Login attemps too frequent");
+            sendCommonResponse(conn, header, false, "Login attempts too frequent");
             return ;
         }
 
@@ -125,28 +125,28 @@ public:
             return ;
         }
 
-        // 验证密码
         if(!Crypot::verifyPassword(request.password(), user.salt, user.password_hash)) {
             sendCommonResponse(conn, header, false, "Wrong password");
             return ;
         }
 
-        //生成临时身份ID
-        std::string devic_id = request.device_id().empty() ? "unknow" : request.device_id();
-        std::string token = TManager::getInstance().generateT(user.user_id, user.username, devic_id, 24);
+        OnlineManager::getInstance().removeUser(user.user_id);
         
-        // 更新在线状态
+        user_dao.updateUserStatus(user.user_id, 1);
+
+        std::string device_id = request.device_id().empty() ? "unknown" : request.device_id();
+        std::string token = TManager::getInstance().generateT(user.user_id, user.username, device_id, 24);
+        
         OnlineManager::getInstance().userOnline(user.user_id);
 
         // 构造登录响应
         p::LoginResponse response;
         response.set_success(true);
         response.set_token(token);
-        response.set_message("LogIN success");
+        response.set_message("Login success");
         response.set_uid(user.user_id);
         response.set_nickname(user.nickname);
 
-        // 发送响应
         p::MessageHeader resp_header;
         resp_header.set_msg_id(header.msg_id() + 1);
         resp_header.set_msg_type(p::MSG_LOGIN);
@@ -157,7 +157,7 @@ public:
             conn->send(data.data(), data.size());
         }
 
-        LOG_INFO << "USER loggend in" << user.username << "( uid= " << user.user_id << " )";
+        LOG_INFO << "User logged in " << user.username << " (uid=" << user.user_id << ")";
     }
 
     //注销处理

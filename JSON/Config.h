@@ -35,17 +35,27 @@ public:
     }
 
     template<typename T>
-    T get(const std::string& key, const T default_value = T()) const{
+    T get(const std::string& key, const T& default_value = T()) const {
         try {
-            if(config_.contains(key)) {
-                return config_[key].get<T>();
+            const json* current = &config_;
+            size_t start = 0, end = key.find('.');
+            while (end != std::string::npos) {
+                std::string part = key.substr(start, end - start);
+                if (!current->contains(part)) {
+                    return default_value;
+                }
+                current = &(*current)[part];
+                start = end + 1;
+                end = key.find('.', start);
             }
+            std::string last_key = key.substr(start);
+            if (current->contains(last_key)) {
+                return (*current)[last_key].get<T>();
+            }
+            return default_value;
+        } catch (...) {
+            return default_value;
         }
-        catch(const std::exception& e) {
-            std::cerr << "Config Failed Find Key : " << key << e.what() << std::endl;
-        }
-
-        return default_value;
     }
 
     template<typename T>

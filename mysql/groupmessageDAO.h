@@ -188,10 +188,19 @@ public:
             return messages;
         }
         
+        LOG_DEBUG << "Query returned " << result.size() << " rows for user " << user_id;
+
         for (const auto& row : result) {
-            GroupMessage msg;
-            fillGroupMessageFromMap(row, msg);
-            messages.push_back(msg);
+            try {
+                GroupMessage msg;
+                fillGroupMessageFromMap(row, msg);
+                LOG_DEBUG << "Filled msg: from_uid=" << msg.from_uid 
+                        << ", content=" << msg.content;
+                messages.push_back(msg);
+            } catch (const std::exception& e) {
+                LOG_ERROR << "Failed to parse row: " << e.what();
+                // 继续处理下一行
+            }
         }
         
         // 标记为已送达
@@ -315,7 +324,13 @@ private:
         msg.extra = row.at("extra");
         msg.status = std::stoi(row.at("status"));
         msg.is_recalled = std::stoi(row.at("is_recalled")) == 1;
-        msg.recalled_at = std::stoll(row.at("recalled_at"));
         msg.created_at = std::stoll(row.at("created_at"));
+
+        auto it_recalled = row.find("recalled_at");
+        if (it_recalled != row.end() && !it_recalled->second.empty()) {
+            msg.recalled_at = std::stoll(it_recalled->second);
+        } else {
+            msg.recalled_at = 0;
+        }
     }
 };

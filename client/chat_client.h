@@ -68,6 +68,7 @@ public:
             connected_ = true;
             running = true;
             recv_thread_ = std::thread(&ChatClient::receiveloop, this);
+            startPreLoginHeartbeat();
             return true;
         }
         return false;
@@ -80,9 +81,55 @@ public:
             recv_thread_.join();
         }
         stopHeartbeat();
+        stopPreLoginHeartbeat();
         client_->disconnect();
         user_.logged_in = false;
     }
+
+    void startPreLoginHeartbeat() {
+        if (pre_login_heartbeat_running_) {
+            return;
+        }
+        pre_login_heartbeat_running_ = true;
+        pre_login_heartbeat_thread_ = std::thread([this]() {
+            while (pre_login_heartbeat_running_ && !user_.logged_in && client_->isConnected()) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                if (!user_.logged_in && client_->isConnected()) {
+                    sendPreLoginHeartbeat();
+                }
+            }
+            LOG_DEBUG << "Pre-login heartbeat thread exiting";
+        });
+    }
+
+    void stopPreLoginHeartbeat() {
+        pre_login_heartbeat_running_ = false;
+        if (pre_login_heartbeat_thread_.joinable()) {
+            pre_login_heartbeat_thread_.join();
+        }
+    }
+
+    void sendPreLoginHeartbeat() {
+        if(!client_->isConnected()) {
+            return;
+        }
+        
+        p::Heartbeat hb;
+        hb.set_timestamp(tool::getTimestamp());
+        hb.set_client_time(tool::getTimestamp());
+        hb.set_seq(0);  // seq=0 表示登录前心跳
+
+        p::MessageHeader header;
+        header.set_msg_type(p::MSG_HEARTBEAT);
+        header.set_timestamp(tool::getTimestamp());
+
+        auto data = proto::MessageCodec::encode(header, hb);
+        if(!data.empty()) {
+            sendData(data);
+            LOG_DEBUG << "Pre-login heartbeat sent";
+        }
+    }
+
 
     void receiveloop() {
         LOG_DEBUG << "receiveloop start";
@@ -188,32 +235,92 @@ public:
                 }
                 break;
             }
-            case p::MSG_GROUP_CREATE:  // type = 8
+            case p::MSG_GROUP_NOTIFICATION:
             {
-                p::CreateGroupResponse resp;
-                if (resp.ParseFromArray(body.data(), body.size())) {
+                LOG_DEBUG << "Processing MSG_GROUP_NOTIFICATION (type=28)";
+                LOG_DEBUG << "body.size() = " << body.size();
+                
+                // 先尝试解析为 CreateGroupResponse
+                p::CreateGroupResponse createResp;
+                if (createResp.ParseFromArray(body.data(), body.size()) && createResp.group_id() > 0) {
+                    LOG_DEBUG << "Parsed as CreateGroupResponse: group_id=" << createResp.group_id();
                     if (msg_callback_) {
-                        if (resp.success()) {
-                            std::string msg = "[群聊] 群组创建成功！群ID: " + std::to_string(resp.group_id());
-                            msg_callback_(msg);
-                            // 刷新群组列表
-                            getGroupList();
+                        std::string msg = "\n 群组创建成功！";
+                        msg += "\n   群组ID: " + std::to_string(createResp.group_id());
+                        if (!createResp.message().empty()) {
+                            msg += "\n   消息: " + createResp.message();
+                        }
+                        msg_callback_(msg);
+                    }
+                    getGroupList();
+                    break;
+                }
+                
+                // 尝试解析为 CommonResponse
+                p::CommonResponse commonResp;
+                if (commonResp.ParseFromArray(body.data(), body.size())) {
+                    LOG_DEBUG << "Parsed as CommonResponse: code=" << commonResp.code() 
+                            << ", message=" << commonResp.message();
+                    if (msg_callback_) {
+                        if (commonResp.code() == 0) {
+                            msg_callback_("[成功] " + commonResp.message());
                         } else {
-                            msg_callback_("[错误] 创建群组失败: " + resp.message());
+                            msg_callback_("[失败] " + commonResp.message());
                         }
                     }
+                    getGroupList();
+                    break;
                 }
+                
+                // 尝试解析为 GroupNotification
+                p::GroupNotification notify;
+                if (notify.ParseFromArray(body.data(), body.size())) {
+                    LOG_DEBUG << "Parsed as GroupNotification: " << notify.message();
+                    if (msg_callback_) {
+                        msg_callback_("[群组通知] " + notify.message());
+                    }
+                    break;
+                }
+                
+                LOG_ERROR << "Failed to parse type=28 message, body size=" << body.size();
                 break;
             }
-            case p::MSG_GROUP_PUSH:
-            {
-                p::GroupMessagePush push;
-                if(push.ParseFromArray(body.data(), body.size())) {
-                    handleGroupPush(push);
+            case p::MSG_GROUP_CHAT: {
+                // 尝试用第一种结构体解析 (用于在线消息)
+                p::GroupMessagePush online_push;
+                if (online_push.ParseFromArray(body.data(), body.size())) {
+                    LOG_DEBUG << "=== Direct field values ===";
+                    LOG_DEBUG << "msg_id: " << online_push.msg_id();
+                    LOG_DEBUG << "group_id: " << online_push.group_id();
+                    LOG_DEBUG << "from_uid: " << online_push.from_uid();
+                    LOG_DEBUG << "from_username: " << online_push.from_username();
+                    LOG_DEBUG << "content: " << online_push.content();
+                    LOG_DEBUG << "msg_type: " << online_push.msg_type();
+                    LOG_DEBUG << "created_at: " << online_push.created_at();
+                    
+                    // 打印 DebugString
+                    LOG_DEBUG << "DebugString: " << online_push.DebugString();
+                    LOG_DEBUG << "Parsed as GroupMessagePush (online message)";
+                    handleGroupPush(online_push);
+                    break; // 解析成功，跳出
                 }
+
+                // 如果第一种失败，再尝试用第二种结构体解析 (用于离线消息)
+                p::GroupChatMessage msg;
+                if (msg.ParseFromArray(body.data(), body.size())) {
+                    LOG_DEBUG << "Parsed GroupChatMessage:";
+                    LOG_DEBUG << "  from_uid: " << msg.from_uid();
+                    LOG_DEBUG << "  group_uid: " << msg.group_uid();
+                    LOG_DEBUG << "  content: " << msg.content();
+                    handleGroupChatMessage(msg);
+                    break; // 解析成功，跳出
+                }
+
+                // 如果两种都失败，说明数据有问题
+                LOG_ERROR << "Failed to parse MSG_GROUP_CHAT with both GroupMessagePush and GroupChatMessage";
                 break;
             }
-            case p::MSG_FRIEND_LIST:  // type=15
+            case p::MSG_FRIEND_LIST:
             {
                 p::FriendListResponse resp;
                 if (resp.ParseFromArray(body.data(), body.size())) {
@@ -236,22 +343,71 @@ public:
                 }
                 break;
             }
+            case p::MSG_GROUP_DISMISS:
+            {
+                LOG_DEBUG << "Processing MAG_GROUP_DISMISS";
+                p::CommonResponse resp;
+                if(resp.ParseFromArray(body.data(), body.size())) {
+                    if (msg_callback_) {
+                        if (resp.code() == 0) {
+                            msg_callback_("[成功] 群组已解散");
+                        }
+                        else {
+                            msg_callback_("[失败] 解散群组失败: " + resp.message());
+                        }
+                    }
+                    // 刷新群组列表
+                    getGroupList();
+                }
+                else {
+                    LOG_ERROR << "Failed to parse CommonResponse for MSG_GROUP_DISMISS";
+                    if (msg_callback_) {
+                        msg_callback_("[错误] 解析解散群组响应失败");
+                    }
+                }
+                break;
+            }
             case p::MSG_GROUP_LIST:
             {
+                LOG_DEBUG << "Processing group list (type=22)";
                 p::GroupListResponse resp;
-                if(resp.ParseFromArray(body.data(), body.size())) {
+                if (resp.ParseFromArray(body.data(), body.size())) {
+                    LOG_DEBUG << "Parsed: groups_size=" << resp.groups_size()
+                            << ", success=" << resp.success();
+                    int count = resp.groups_size();
+                    for (int i = 0; i < count; ++i) {
+                        const auto& g = resp.groups(i);
+                        LOG_DEBUG << "  Group[" << i << "]: id=" << g.group_id() 
+                                << ", name='" << g.group_name() << "'"
+                                << ", owner=" << g.owner_id()
+                                << ", member_count=" << g.member_count()
+                                << ", is_public=" << g.is_public();
+                    }
+
                     if (msg_callback_) {
                         int count = resp.groups_size();
                         if (count == 0) {
                             msg_callback_("群聊列表: (0个)");
                         } else {
-                            std::string out = "我的群聊 (" + std::to_string(count) + "个):";
-                            for (int i = 0; i < count; ++i) {
+                            std::ostringstream oss;
+                            oss << "我的群聊 (" << count << "个):";
+                            for(int i = 0; i < count; ++i) {
                                 const auto& g = resp.groups(i);
-                                out += "\n  " + std::to_string(g.group_id()) + " " + g.group_name();
+                                std::string name = g.group_name();
+                                if(name.empty()) {
+                                    name = "未命名群组";
+                                }
+                                oss << "\n "  << name << "(ID:" << g.group_id() << ")";
                             }
-                            msg_callback_(out);
+                            std::string output = oss.str();
+                            LOG_DEBUG << "Group list output: " << output;
+                            msg_callback_(output);
                         }
+                    }
+                } else {
+                    LOG_ERROR << "Failed to parse GroupListResponse";
+                    if (msg_callback_) {
+                        msg_callback_("[错误] 解析群组列表失败");
                     }
                 }
                 break;
@@ -320,11 +476,21 @@ public:
             case p::MSG_OFFLINE_NOTIFY:
             {
                 p::OfflineMessageNotify notify;
-                if(notify.ParseFromArray(body.data(), body.size())) {
-                    if(msg_callback_) {
-                        msg_callback_("[离线消息] " + std::to_string(notify.count()) + "条离线消息");
-                        getOfflineMessages();
+                if (notify.ParseFromArray(body.data(), body.size())) {
+                    if (msg_callback_) {
+                        std::string msg = "[离线消息] 收到 " + std::to_string(notify.total_count()) + " 条离线消息";
+                        if (notify.private_count() > 0) {
+                            msg += " (私聊: " + std::to_string(notify.private_count()) + "条)";
+                        }
+                        if (notify.group_count() > 0) {
+                            msg += " (群聊: " + std::to_string(notify.group_count()) + "条)";
+                        }
+                        msg_callback_(msg);
                     }
+                    // 请求离线消息内容
+                    getOfflineMessages();
+                } else {
+                    LOG_ERROR << "Failed to parse OfflineMessageNotify";
                 }
                 break;
             }
@@ -441,7 +607,6 @@ public:
                 }
                 break;
             }
-
             case p::MSG_FILE_OFFLINE_LIST_RESP:
             {
                 db::FileOfflineListResp resp;
@@ -450,7 +615,7 @@ public:
                 }
                 break;
             }
-            case p::MSG_COMMON_RESPONSE:  // type=66
+            case p::MSG_COMMON_RESPONSE:
             {
                 p::CommonResponse resp;
                 if (resp.ParseFromArray(body.data(), body.size())) {
@@ -461,7 +626,7 @@ public:
                 }
                 break;
             }
-            case p::MSG_COMMON_REQUEST:  // type = 65
+            case p::MSG_COMMON_REQUEST:
             {
                 p::CommonResponse resp;
                 if (resp.ParseFromArray(body.data(), body.size())) {
@@ -481,7 +646,7 @@ public:
                 }
                 break;
             }
-            case p::MSG_ADD_FRIEND:  // type = 13
+            case p::MSG_ADD_FRIEND:
             {
                 p::CommonResponse resp;
                 if (resp.ParseFromArray(body.data(), body.size())) {
@@ -492,7 +657,7 @@ public:
                 }
                 break;
             }
-            case p::MSG_DELETE_FRIEND:  // type = 16
+            case p::MSG_DELETE_FRIEND:
             {
                 p::CommonResponse resp;
                 if (resp.ParseFromArray(body.data(), body.size())) {
@@ -503,7 +668,7 @@ public:
                 }
                 break;
             }
-            case p::MSG_PROCESS_FRIEND_REQUEST:  // type = 14
+            case p::MSG_PROCESS_FRIEND_REQUEST:
             {
                 p::CommonResponse resp;
                 if (resp.ParseFromArray(body.data(), body.size())) {
@@ -536,7 +701,6 @@ public:
                 }
                 break;
             }
-
             default:
                 LOG_DEBUG << "Unhandle message type: " << header.msg_type();
                 break; 
@@ -885,14 +1049,29 @@ public:
     }
 
     void getGroupList() {
+        if(!user_.logged_in) {
+            if(msg_callback_) {
+                msg_callback_("[错误] 未登录，无法获取群组列表");
+            }
+            LOG_DEBUG << "Not logged in, cannot get group list";
+            return;
+        }
+        
+        LOG_DEBUG << "Requesting group list for user " << user_.uid;
+        
         p::GetGroupListRequest req;
         p::MessageHeader header;
         header.set_msg_type(p::MSG_GROUP_LIST);
         header.set_timestamp(tool::getTimestamp());
+        header.set_from_uid(user_.uid);
+        header.set_to_uid(user_.uid);
 
         auto data = proto::MessageCodec::encode(header, req);
         if(!data.empty()) {
             sendData(data);
+            LOG_DEBUG << "Group list request sent";
+        } else {
+            LOG_ERROR << "Failed to encode group list request";
         }
     }
 
@@ -1831,6 +2010,8 @@ private:
     std::unordered_map<std::string, std::ofstream> downloading_files_;
     int epoll_fd_ {-1};
     bool running = false;
+    std::atomic<bool> pre_login_heartbeat_running_{false};
+    std::thread pre_login_heartbeat_thread_;
 
     UserInfo user_;
 
@@ -1874,7 +2055,8 @@ private:
                 msg_callback_("[系统] 登录成功， 用户：" + resp.nickname() + ", 用户ID：" + std::to_string(user_.uid));
             }
 
-            startHeartbeat(30);
+            stopPreLoginHeartbeat();
+            startHeartbeat(15);
             
             getFriendList();
             getConversationList();
@@ -1902,8 +2084,14 @@ private:
             std::string from_str = (from == user_.uid) ? "我" : std::to_string(from);
             std::string content = msg.content();
 
-            if (from == 0 && content.empty()) {
-                LOG_DEBUG << "Ignoring empty echo message";
+            if (from == 0) {
+                if (!content.empty()) {
+                    // 显示离线消息内容
+                    msg_callback_("[离线消息] " + content);
+                } else {
+                    // 空内容可能是通知
+                    LOG_DEBUG << "Empty offline message notification";
+                }
                 return;
             }
 
@@ -1916,16 +2104,46 @@ private:
     }
 
     void handleGroupPush(const p::GroupMessagePush& push) {
-        if(msg_callback_) {
-            std::string from = push.from_username();
-            if (from.empty()) {
-                from = std::to_string(push.from_uid());
+        LOG_DEBUG << "=== GroupMessagePush Debug ===";
+        
+        std::string debug_str;
+        google::protobuf::util::MessageToJsonString(push, &debug_str);
+        LOG_DEBUG << "JSON representation: " << debug_str;
+        
+        const auto* descriptor = push.GetDescriptor();
+        const auto* reflection = push.GetReflection();
+        for (int i = 0; i < descriptor->field_count(); ++i) {
+            const auto* field = descriptor->field(i);
+            if (reflection->HasField(push, field)) {
+                LOG_DEBUG << "Field " << field->name() << " (number " << field->number() 
+                        << ") is set";
+            } else {
+                LOG_DEBUG << "Field " << field->name() << " (number " << field->number() 
+                        << ") is NOT set";
             }
+        }
+              
+        if(msg_callback_) {
+            uint64_t from_uid = push.from_uid();
             std::string content = push.content();
+            uint64_t group_id = push.group_id();
             if (content.empty()) {
                 content = "(空消息)";
             }
-            msg_callback_("[群聊] " + std::to_string(push.group_id()) + " " + from + ": " + content);
+            std::string display_content = content.empty() ? "(空消息)" : content;
+            msg_callback_("[群聊] " + std::to_string(push.group_id()) + " " + std::to_string(from_uid) + ": " + content);
+        }
+    }
+
+    void handleGroupChatMessage(const p::GroupChatMessage& msg) {
+        if(msg_callback_) {
+            std::string from = std::to_string(msg.from_uid());
+            std::string content = msg.content();
+            if (content.empty()) {
+                content = "(空消息)";
+            }
+            // 注意：GroupChatMessage 中的字段是 group_uid
+            msg_callback_("[群聊] " + std::to_string(msg.group_uid()) + " " + from + ": " + content);
         }
     }
 
