@@ -1,9 +1,9 @@
 #pragma once
 
 #include "protobuf/p.h"
-#include "../logging.h"
-#include "../tool.h"
-#include "../epoll.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
+#include "net/epoll.h"
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
