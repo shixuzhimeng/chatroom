@@ -4,13 +4,13 @@
 #include "mysql/groupDAO.h"
 #include "mysql/userDAO.h"
 #include "protobuf/p.h"
-#include "../logging.h"
-#include "../tool.h"
-#include "../epoll.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
+#include "net/epoll.h"
 #include <unordered_map>
 #include <functional>
 #include "TLS/TLS.h"
-#include "../Check.h"
+#include "tool/Check.h"
 
 
 class GroupHandle{
@@ -156,23 +156,27 @@ public:
             return;
         }
 
-        // 返回成功响应
+        // 返回成功响应给创建者（携带 group_id）
         p::CreateGroupResponse response;
         response.set_success(true);
         response.set_group_id(group_id);
         response.set_message("Group created successfully");
+        sendGroupResponse(conn, header, response, p::MSG_GROUP_CREATE);
         
-        // 发送通知给所有成员
+        // 发送通知给其他成员不含创建者
         p::GroupNotification notify;
         notify.set_type(p::GroupNotification::NOTIFY_NEW_MEMBER);
         notify.set_group_id(group_id);
         notify.set_user_id(user_id);
         notify.set_message("You were added to group: " + request.group_name());
         
-        for (uint64_t uid : member_ids) {
-            auto it = user_connections_->find(uid);
-            if (it != user_connections_->end()) {
-                sendNotification(it->second, notify);
+        if (user_connections_) {
+            for (uint64_t uid : member_ids) {
+                if (uid == user_id) continue;  // 创建者通过 CreateGroupResponse 获知
+                auto it = user_connections_->find(uid);
+                if (it != user_connections_->end()) {
+                    sendNotification(it->second, notify);
+                }
             }
         }
 
@@ -301,14 +305,15 @@ public:
             req.created_at = tool::getTimestamp();
             req.updated_at = tool::getTimestamp();
 
-            if(!dao.addJoinRequest(req)) {
+            uint64_t request_id = 0;
+            if(!dao.addJoinRequest(req, request_id)) {
                 LOG_ERROR << "Failed to add join request for group " << group_id << "by user " << user_id;
                 sendGroupResponse(conn, header, false, "Failed to submit join request");
                 return ;
             }
 
-            // 通知群主和管理员
-            notifyJoinrequest(group_id, user_id, message);
+            // 通知群主和管理员（携带 request_id 供 approve 使用）
+            notifyJoinrequest(group_id, user_id, message, request_id);
 
             sendGroupResponse(conn, header, true, "submit join submit");
             LOG_INFO << "User " << user_id << "requested to join group " << group_id;
@@ -533,7 +538,7 @@ public:
 
         // 通知被踢掉的用户和群组成员
         notifyMemberLeft(group_id, target_id);
-        notifyKicked(group_id, target_id);
+        notifyKicked(target_id, group_id);
 
         sendGroupResponse(conn, header, true, "Member kicked success");
         LOG_INFO << "User " << target_id << "Kicked from group " << group_id;
@@ -716,10 +721,13 @@ private:
     }
 
     // 发送通知
-    void sendNotification(std::shared_ptr<TcpConnection> conn, const p::GroupNotification& notify) {
+    void sendNotification(std::shared_ptr<TcpConnection> conn, const p::GroupNotification& notify, uint64_t request_id = 0) {
         p::MessageHeader header;
         header.set_msg_type(p::MSG_GROUP_NOTIFICATION);
         header.set_timestamp(tool::getTimestamp());
+        if (request_id > 0) {
+            header.set_request_id(request_id);
+        }
     
         auto data = proto::MessageCodec::encode(header, notify);
         if(!data.empty()) {
@@ -769,22 +777,38 @@ private:
     }
 
     //
-    void notifyJoinrequest(uint64_t group_id, uint64_t from_id, const std::string& message) {
+    void notifyJoinrequest(uint64_t group_id, uint64_t from_id, const std::string& message, uint64_t request_id = 0) {
         // 通知群主和管理员
         GroupDAO dao;
         auto members = dao.getGroupMembers(group_id);
+
+        // 获取申请人的用户名，构造清晰的申请提示
+        std::string from_name = std::to_string(from_id);
+        UserDAO user_dao;
+        USER user;
+        if (user_dao.getUserByID(from_id, user)) {
+            from_name = user.nickname.empty() ? user.username : user.nickname;
+        }
 
         p::GroupNotification notify;
         notify.set_type(p::GroupNotification::NOTIFY_JOIN_REQUEST);
         notify.set_group_id(group_id);
         notify.set_user_id(from_id);
-        notify.set_message(message);
+
+        std::string msg = "用户 " + from_name + " (ID:" + std::to_string(from_id) + ") 请求加入群组 " + std::to_string(group_id);
+        if (!message.empty()) {
+            msg += "，附言: " + message;
+        }
+        if (request_id > 0) {
+            msg += "，请求ID: " + std::to_string(request_id) + "，使用 /approve " + std::to_string(request_id) + " true/false 处理";
+        }
+        notify.set_message(msg);
 
         for(const auto& member : members) {
             if(member.role >= 1 && user_connections_) {
                 auto it = user_connections_->find(member.user_id);
                 if(it != user_connections_->end()) {
-                    sendNotification(it->second, notify);
+                    sendNotification(it->second, notify, request_id);
                 }
             }
         }
