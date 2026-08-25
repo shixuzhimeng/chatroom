@@ -3,7 +3,7 @@
 // 用户会话管理
 
 #include "HashSalt.h"
-#include "../logging.h"
+#include "tool/logging.h"
 #include <unordered_map>
 #include <mutex>
 #include <string>

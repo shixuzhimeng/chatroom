@@ -1,7 +1,7 @@
 #pragma once
 
 #include "HashSalt.h"
-#include "../logging.h"
+#include "tool/logging.h"
 #include <unordered_map>
 #include <mutex>
 #include <chrono>

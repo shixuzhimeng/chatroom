@@ -5,8 +5,8 @@
 #include "HashSalt.h"
 #include "yanzheng.h"
 #include "Manager.h"
-#include "../logging.h"
-#include "../epoll.h"
+#include "tool/logging.h"
+#include "net/epoll.h"
 #include "Check.h"
 #include "limiter.h"
 #include "mysql/groupmessageDAO.h"
@@ -203,30 +203,30 @@ public:
     void handleDeleteAccount(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
         p::DeleteAccountRequest request;
         if(!request.ParseFromArray(body.data(), body.size())) {
-            sendCommonResponse(conn, header, false, "Invalid requset");
+            sendCommonResponse(conn, header, false, "Invalid requset", p::MSG_DELETE_ACCOUNT);
             return ;
         }
 
         uint64_t user_id = conn->getUserID();
         if(user_id == 0) {
-            sendCommonResponse(conn, header, false, "User not logged in");
+            sendCommonResponse(conn, header, false, "User not logged in", p::MSG_DELETE_ACCOUNT);
             return ;
         }
 
         std::string TID = request.token();
         if(TID.empty()) {
-            sendCommonResponse(conn, header, false, "TID required");
+            sendCommonResponse(conn, header, false, "TID required", p::MSG_DELETE_ACCOUNT);
             return ;
         }
 
         TManager::TInfo info;
         if(!TManager::getInstance().verifyT(TID, info)) {
-            sendCommonResponse(conn, header, false, "Invalid token");
+            sendCommonResponse(conn, header, false, "Invalid token", p::MSG_DELETE_ACCOUNT);
             return ;
         }
 
         if(!request.confirm()) {
-            sendCommonResponse(conn, header, false, "Invalid required");
+            sendCommonResponse(conn, header, false, "Invalid required", p::MSG_DELETE_ACCOUNT);
             return ;
         }
 
@@ -234,11 +234,11 @@ public:
             UserDAO user_dao;
             USER user;
             if(!user_dao.getUserByID(info.user_id, user)) {
-                sendCommonResponse(conn, header, false, "User not found");
+                sendCommonResponse(conn, header, false, "User not found", p::MSG_DELETE_ACCOUNT);
                 return ;
             }
             if(!Crypot::verifyPassword(request.password(), user.salt, user.password_hash)) {
-                sendCommonResponse(conn, header, false, "Invalid password");
+                sendCommonResponse(conn, header, false, "Invalid password", p::MSG_DELETE_ACCOUNT);
                 return ;
             }
         }
@@ -267,7 +267,7 @@ public:
         }
         catch(const std::exception& e) {
             LOG_ERROR << "Delete account failed";
-            sendCommonResponse(conn, header, false, "Deleted failed");
+            sendCommonResponse(conn, header, false, "Deleted failed", p::MSG_DELETE_ACCOUNT);
             return ;
         }
 
@@ -285,8 +285,6 @@ public:
         if(!data.empty()) {
             conn->send(data.data(), data.size());
         }
-
-        conn->isClosed();
 
         LOG_INFO << "User account deleted: " << info.username << " (uid = " << info.user_id << " )";
     }
@@ -382,18 +380,18 @@ public:
             LOG_INFO << "Auto created user for email: " << email;
         }
         
-        // 5. 生成 token
+        // 生成 token
         std::string token = TManager::getInstance().generateT(
             user.user_id, 
             user.username, 
             device_id.empty() ? "unknown" : device_id, 
-            24  // 24小时有效
+            24
         );
         
-        // 6. 更新在线状态
+        // 更新在线状态
         user_dao.updateUserStatus(user.user_id, 1);
         
-        // 7. 构造登录响应
+        // 构造登录响应
         p::LoginResponse response;
         response.set_success(true);
         response.set_token(token);
@@ -417,7 +415,7 @@ public:
 
 
 private:
-    void sendCommonResponse(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, bool success, const std::string& msg) {
+    void sendCommonResponse(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, bool success, const std::string& msg, p::MessageType type = p::MSG_COMMON_RESPONSE) {
         LOG_INFO << "sendCommonResponse: success=" << success << ", msg=" << msg;
         
         p::CommonResponse response;
@@ -427,7 +425,7 @@ private:
 
         p::MessageHeader resp_header;
         resp_header.set_msg_id(header.msg_id() + 1);
-        resp_header.set_msg_type(p::MSG_COMMON_RESPONSE);
+        resp_header.set_msg_type(type);
         resp_header.set_timestamp(tool::getTimestamp());
         
         LOG_INFO << "sendCommonResponse: encoding...";
