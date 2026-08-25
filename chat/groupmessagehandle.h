@@ -4,13 +4,14 @@
 #include "mysql/groupDAO.h"
 #include "mysql/groupmessageDAO.h"
 #include "mysql/friendDAO.h"
-#include "../logging.h"
-#include "../tool.h"
-#include "../epoll.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
+#include "net/epoll.h"
 #include <unordered_map>
 #include <set>
 #include <mutex>
-#include "../deduplicator.h"
+#include "tool/deduplicator.h"
+#include "tool/Check.h"
 
 class GroupChatHandle {
 public:
@@ -42,9 +43,17 @@ public:
             return;
         }
 
+        // 任意群聊消息都视为活跃，刷新心跳，避免高频聊天时因心跳超时被踢下线
+        //OnlineManager::getInstance().updateHeartbeat(from_uid);
+
         uint64_t group_id = request.group_id();
         std::string content = request.content();
         int msg_type = request.msg_type();
+
+        if(!InputValidator::validateMessageContent(content)) {
+            sendGroupChatResponse(conn, header, false, "invalid message content");
+            return;
+        }
 
         // 验证是否为群组成员
         if(!group_dao_->isGroupMember(group_id, from_uid)) {
@@ -136,27 +145,22 @@ public:
 
             std::vector<uint64_t> offline_members;
 
-            // 发送给所有在线成员
+            // 发送给所有在线成员（含发送者自己，实现回显）
             for(const auto& m : members) {
-                
-                if(m.user_id == from_uid) {
-                    LOG_DEBUG << "Skip sender " << from_uid << " for broadcast";
-                    continue;
-                }
 
                 bool is_online = false;
                 if(user_connections_) {
                     auto it = user_connections_->find(m.user_id);
                     if(it != user_connections_->end()) {
                         is_online = true;
-                        
+
                         p::MessageHeader push_header;
                         push_header.set_msg_id(msg_id);
                         push_header.set_msg_type(p::MSG_GROUP_CHAT);
                         push_header.set_from_uid(from_uid);
                         push_header.set_to_uid(group_id);
                         push_header.set_timestamp(tool::getTimestamp());
-                    
+
                         LOG_INFO << "Sending GroupMessagePush to user " << m.user_id;
                         auto data = proto::MessageCodec::encode(push_header, push_msg);
                         if(!data.empty()) {
@@ -166,24 +170,22 @@ public:
                     }
                 }
 
-                if(!is_online) {
+                if(!is_online && m.user_id != from_uid) {
                     offline_members.push_back(m.user_id);
                 }
             }
 
-            // 保存离线消息
+            // 保存离线消息（不含发送者自己）
             for(uint64_t uid : offline_members) {
-                if(uid != from_uid) {  // 确保不保存发送者自己的离线消息
-                    dao.saveGroupOfflineMessage(uid, group_id, msg_id);
-                }
+                dao.saveGroupOfflineMessage(uid, group_id, msg_id);
             }
 
             LOG_INFO << "Group message " << msg_id << " sent to " << members.size() 
                     << " members, " << offline_members.size() << " offline";
         }
 
-        // 最后发送响应给发送者（在这个作用域外，push_msg 已经被销毁）
-        sendGroupChatResponse(conn, header, true, "Message sent");
+        // 最后发送响应给发送者
+        //sendGroupChatResponse(conn, header, true, "Message sent");
     }
 
     // 获取群组历史消息

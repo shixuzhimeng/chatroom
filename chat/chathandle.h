@@ -4,17 +4,19 @@
 #include "mysql/userDAO.h"
 #include "mysql/friendDAO.h"
 #include "mysql/messageDAO.h"
+#include "mysql/fileDAO.h"
 #include "mysql/pingbiDAO.h"
 #include "mysql/mysqlPool.h"
-#include "../logging.h"
-#include "../epoll.h"
+#include "tool/logging.h"
+#include "net/epoll.h"
 #include "tool.h"
 #include <unordered_map>
 #include <map>
 #include <mutex>
+#include <algorithm>
 #include "TLS/TLS.h"
-#include "../deduplicator.h"
-#include "../Check.h"
+#include "tool/deduplicator.h"
+#include "tool/Check.h"
 
 
 class ChatHandle {
@@ -55,11 +57,12 @@ public:
             return ;
         }
 
+        // 任意聊天消息都视为活跃，刷新心跳，避免高频聊天时因心跳超时被踢下线
+        //OnlineManager::getInstance().updateHeartbeat(from_uid);
+
         uint64_t to_uid = request.to_uid();
         std::string content = request.content();
         int msg_type = request.msg_type();
-
-        LOG_INFO << "Chat from " << from_uid << " to " << to_uid << " : " << content;
 
         // 不能给自己发消息
         if (from_uid == to_uid) {
@@ -67,15 +70,15 @@ public:
             return ;
         }
 
-        // 验证好友关系
-        if(friend_dao_ && !friend_dao_->isFriend(to_uid, from_uid)) {
-            sendChatResponse(conn, header, false, "Not friend");
-            return ;
-        }
-
         // 检查是否被屏蔽
         if(block_dao_ && block_dao_->isBlocked(to_uid, from_uid)){
             sendChatResponse(conn, header, false, "You are blocked by this user");
+            return ;
+        }
+
+        // 验证好友关系
+        if(friend_dao_ && !friend_dao_->isFriend(to_uid, from_uid)) {
+            sendChatResponse(conn, header, false, "Not friend");
             return ;
         }
 
@@ -100,7 +103,6 @@ public:
 
         MessageDeduplicator& dedup = MessageDeduplicator::getInstance();
         if(dedup.isDuplicate(msg_id)) {
-            LOG_ERROR << "Duplicate message detected, msg_id=" << msg_id;
             return ;
         }
         dedup.markProcessed(msg_id);
@@ -124,7 +126,6 @@ public:
         auto echo_data = proto::MessageCodec::encode(echo_header, echo_msg);
         if(!echo_data.empty()) {
             conn->send(echo_data.data(), echo_data.size());
-            LOG_DEBUG << "Echo sent to sender " << from_uid;
         }
 
         // 检查对方是否在线
@@ -153,13 +154,12 @@ public:
                 dao.updateMessageStatus(msg_id, 1);
             }
 
-            sendChatResponse(conn, header, true, "Message delivered");
+            //sendChatResponse(conn, header, true, "Message delivered");
         }
         else {
             // 离线存储消息
             if(dao.saveOfflineMessage(to_uid, msg_id)) {
                 sendChatResponse(conn, header, true, "Message saved (offline)");
-                LOG_INFO << "Message saved offline for user " << to_uid;
             }
             else {
                 sendChatResponse(conn, header, false, "Failed to save offline message");
@@ -199,27 +199,82 @@ public:
             messages = dao.getChatHistory(user_id, target_uid, limit);
         }
 
+        // 查询文件历史
+        FileDAO file_dao;
+        std::vector<FileRecord> files;
+        if(before_time > 0) {
+            files = file_dao.getFileHistory(user_id, target_uid, limit, before_time);
+        }
+        else {
+            files = file_dao.getFileHistory(user_id, target_uid, limit);
+        }
+
         // 响应
         p::HistoryResponse response;
         response.set_success(true);
         response.set_target_uid(target_uid);
 
-        for(const auto& msg : messages) {
+        // 合并消息与文件，按时间升序
+        struct HistoryItem {
+            int64_t time = 0;
+            bool is_file = false;
+            Message msg;
+            FileRecord file;
+        };
+        std::vector<HistoryItem> items;
+        for(const auto& m : messages) {
+            HistoryItem it;
+            it.time = m.created_at;
+            it.is_file = false;
+            it.msg = m;
+            items.push_back(it);
+        }
+        for(const auto& f : files) {
+            HistoryItem it;
+            it.time = f.upload_time;
+            it.is_file = true;
+            it.file = f;
+            items.push_back(it);
+        }
+        std::sort(items.begin(), items.end(), [](const HistoryItem& a, const HistoryItem& b) {
+            return a.time < b.time;
+        });
+        // 只保留最新的 limit 条
+        if(static_cast<int>(items.size()) > limit) {
+            items.erase(items.begin(), items.begin() + (items.size() - limit));
+        }
+
+        for(const auto& it : items) {
             auto* msg_info = response.add_messages();
-            msg_info->set_msg_id(msg.msg_id);
-            msg_info->set_msg_type(msg.msg_type);
-            msg_info->set_from_uid(msg.from_uid);
-            msg_info->set_to_uid(msg.to_uid);
-            msg_info->set_content(msg.content);
-            msg_info->set_status(msg.status);
-            msg_info->set_is_recalled(msg.is_recalled);
-            msg_info->set_created_at(msg.created_at);
-            msg_info->set_read_at(msg.read_at);
-            msg_info->set_delivered_at(msg.delivered_at);
+            if(it.is_file) {
+                msg_info->set_msg_type(3);   // 文件
+                msg_info->set_from_uid(it.file.from_uid);
+                msg_info->set_to_uid(it.file.to_uid);
+                msg_info->set_content(it.file.filename);
+                msg_info->set_status(1);
+                msg_info->set_is_recalled(false);
+                msg_info->set_created_at(it.file.upload_time);
+                msg_info->set_file_id(it.file.file_id);
+                msg_info->set_file_size(it.file.file_size);
+                msg_info->set_md5(it.file.md5);
+            }
+            else {
+                const auto& msg = it.msg;
+                msg_info->set_msg_id(msg.msg_id);
+                msg_info->set_msg_type(msg.msg_type);
+                msg_info->set_from_uid(msg.from_uid);
+                msg_info->set_to_uid(msg.to_uid);
+                msg_info->set_content(msg.content);
+                msg_info->set_status(msg.status);
+                msg_info->set_is_recalled(msg.is_recalled);
+                msg_info->set_created_at(msg.created_at);
+                msg_info->set_read_at(msg.read_at);
+                msg_info->set_delivered_at(msg.delivered_at);
+            }
         }
 
         sendHistoryResponse(conn, header, response);
-        LOG_INFO << "Retrieved " << messages.size() << " messages for chat between " << user_id << " and " << target_uid;
+        LOG_INFO << "Retrieved " << items.size() << " messages for chat between " << user_id << " and " << target_uid;
     }
 
     // 标记消息为已读
@@ -268,7 +323,7 @@ public:
                     }
                 }
             }
-            sendChatResponse(conn, header, true, "Message marked as read");
+            //sendChatResponse(conn, header, true, "Message marked as read");
         }
         else {
             sendChatResponse(conn, header, false, "Failed to mark");
@@ -481,7 +536,7 @@ private:
 
         p::MessageHeader resp_header;
         resp_header.set_msg_id(header.msg_id() + 1);
-        resp_header.set_msg_type(header.msg_type());
+        resp_header.set_msg_type(p::MSG_COMMON_REQUEST);
         resp_header.set_timestamp(tool::getTimestamp());
 
         auto data = proto::MessageCodec::encode(resp_header, response);
