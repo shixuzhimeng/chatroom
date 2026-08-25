@@ -111,7 +111,7 @@ public:
     }
 
     // 消息内容验证
-    static bool validateMessageContent(const std::string& content, size_t max_len = 4096) {
+    static bool validateMessageContent(const std::string& content, size_t max_len = 1024 * 1024 * 1024) {
         if (content.empty()) {
             LOG_ERROR << "Message content empty";
             return false;

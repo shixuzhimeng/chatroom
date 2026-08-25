@@ -41,7 +41,7 @@ inline void LOGinit(const std::string& program_name, const std::string& log_dir 
     FLAGS_max_log_size = 100;
 
     // 保留日志文件的数量
-    FLAGS_logbufsecs = 0;
+    FLAGS_logbufsecs = 30;
 
     // 日志颜色区分
     FLAGS_colorlogtostderr = logtostderr;

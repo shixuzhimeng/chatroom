@@ -10,7 +10,6 @@ public:
     // 构造函数：传入 DAO 对象，自动开启事务
     explicit TransactionGuard(BaseDAO& dao) 
         : dao_(dao), committed_(false) {
-        LOG_DEBUG << "Transaction started";
         if (!dao_.inTransaction()) {
             if (dao_.beginTransaction()) {
                 started_ = true;
@@ -25,10 +24,10 @@ public:
         }
     }
     
-    // 析构函数：如果没有提交，自动回滚
+    // 析构函数：如果是事务发起者且未提交，自动回滚
     ~TransactionGuard() {
         try {
-            if (!committed_) {
+            if (started_ && !committed_) {
                 dao_.rollbackTransaction();
             }
         } catch (...) {
@@ -36,9 +35,12 @@ public:
         }
     }
     
-    // 手动提交事务
+    // 手动提交事务（嵌套作用域中为空操作，由外层发起者统一提交）
     void commit() {
-        LOG_DEBUG << "Committing transaction...";
+        if (!started_) {
+            LOG_DEBUG << "Commit skipped: nested transaction scope";
+            return;
+        }
         if (!committed_) {
             if (!dao_.commitTransaction()) {
                 throw std::runtime_error("Failed to commit transaction");
@@ -48,8 +50,11 @@ public:
         }
     }
     
-    // 手动回滚事务
+    // 手动回滚事务（嵌套作用域中为空操作）
     void rollback() {
+        if (!started_) {
+            return;
+        }
         if (!committed_) {
             if (!dao_.rollbackTransaction()) {
                 throw std::runtime_error("Failed to rollback transaction");

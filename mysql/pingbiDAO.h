@@ -1,7 +1,7 @@
 #pragma once
 
 #include "baseDAO.h"
-#include "tool.h"
+#include "tool/tool.h"
 
 class BlockDAO : public BaseDAO {
 public:

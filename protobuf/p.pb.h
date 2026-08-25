@@ -9720,6 +9720,8 @@ class HistoryMessage final :
 
   enum : int {
     kContentFieldNumber = 4,
+    kFileIdFieldNumber = 11,
+    kMd5FieldNumber = 13,
     kMsgIdFieldNumber = 1,
     kFromUidFieldNumber = 2,
     kToUidFieldNumber = 3,
@@ -9728,6 +9730,7 @@ class HistoryMessage final :
     kCreatedAtFieldNumber = 8,
     kDeliveredAtFieldNumber = 9,
     kReadAtFieldNumber = 10,
+    kFileSizeFieldNumber = 12,
     kIsRecalledFieldNumber = 7,
   };
   // string content = 4;
@@ -9742,6 +9745,34 @@ class HistoryMessage final :
   const std::string& _internal_content() const;
   inline PROTOBUF_ALWAYS_INLINE void _internal_set_content(const std::string& value);
   std::string* _internal_mutable_content();
+  public:
+
+  // string file_id = 11;
+  void clear_file_id();
+  const std::string& file_id() const;
+  template <typename ArgT0 = const std::string&, typename... ArgT>
+  void set_file_id(ArgT0&& arg0, ArgT... args);
+  std::string* mutable_file_id();
+  PROTOBUF_NODISCARD std::string* release_file_id();
+  void set_allocated_file_id(std::string* file_id);
+  private:
+  const std::string& _internal_file_id() const;
+  inline PROTOBUF_ALWAYS_INLINE void _internal_set_file_id(const std::string& value);
+  std::string* _internal_mutable_file_id();
+  public:
+
+  // string md5 = 13;
+  void clear_md5();
+  const std::string& md5() const;
+  template <typename ArgT0 = const std::string&, typename... ArgT>
+  void set_md5(ArgT0&& arg0, ArgT... args);
+  std::string* mutable_md5();
+  PROTOBUF_NODISCARD std::string* release_md5();
+  void set_allocated_md5(std::string* md5);
+  private:
+  const std::string& _internal_md5() const;
+  inline PROTOBUF_ALWAYS_INLINE void _internal_set_md5(const std::string& value);
+  std::string* _internal_mutable_md5();
   public:
 
   // uint64 msg_id = 1;
@@ -9816,6 +9847,15 @@ class HistoryMessage final :
   void _internal_set_read_at(int64_t value);
   public:
 
+  // uint64 file_size = 12;
+  void clear_file_size();
+  uint64_t file_size() const;
+  void set_file_size(uint64_t value);
+  private:
+  uint64_t _internal_file_size() const;
+  void _internal_set_file_size(uint64_t value);
+  public:
+
   // bool is_recalled = 7;
   void clear_is_recalled();
   bool is_recalled() const;
@@ -9834,6 +9874,8 @@ class HistoryMessage final :
   typedef void DestructorSkippable_;
   struct Impl_ {
     ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr content_;
+    ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr file_id_;
+    ::PROTOBUF_NAMESPACE_ID::internal::ArenaStringPtr md5_;
     uint64_t msg_id_;
     uint64_t from_uid_;
     uint64_t to_uid_;
@@ -9842,6 +9884,7 @@ class HistoryMessage final :
     int64_t created_at_;
     int64_t delivered_at_;
     int64_t read_at_;
+    uint64_t file_size_;
     bool is_recalled_;
     mutable ::PROTOBUF_NAMESPACE_ID::internal::CachedSize _cached_size_;
   };
@@ -19371,6 +19414,126 @@ inline void HistoryMessage::_internal_set_read_at(int64_t value) {
 inline void HistoryMessage::set_read_at(int64_t value) {
   _internal_set_read_at(value);
   // @@protoc_insertion_point(field_set:p.HistoryMessage.read_at)
+}
+
+// string file_id = 11;
+inline void HistoryMessage::clear_file_id() {
+  _impl_.file_id_.ClearToEmpty();
+}
+inline const std::string& HistoryMessage::file_id() const {
+  // @@protoc_insertion_point(field_get:p.HistoryMessage.file_id)
+  return _internal_file_id();
+}
+template <typename ArgT0, typename... ArgT>
+inline PROTOBUF_ALWAYS_INLINE
+void HistoryMessage::set_file_id(ArgT0&& arg0, ArgT... args) {
+ 
+ _impl_.file_id_.Set(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
+  // @@protoc_insertion_point(field_set:p.HistoryMessage.file_id)
+}
+inline std::string* HistoryMessage::mutable_file_id() {
+  std::string* _s = _internal_mutable_file_id();
+  // @@protoc_insertion_point(field_mutable:p.HistoryMessage.file_id)
+  return _s;
+}
+inline const std::string& HistoryMessage::_internal_file_id() const {
+  return _impl_.file_id_.Get();
+}
+inline void HistoryMessage::_internal_set_file_id(const std::string& value) {
+  
+  _impl_.file_id_.Set(value, GetArenaForAllocation());
+}
+inline std::string* HistoryMessage::_internal_mutable_file_id() {
+  
+  return _impl_.file_id_.Mutable(GetArenaForAllocation());
+}
+inline std::string* HistoryMessage::release_file_id() {
+  // @@protoc_insertion_point(field_release:p.HistoryMessage.file_id)
+  return _impl_.file_id_.Release();
+}
+inline void HistoryMessage::set_allocated_file_id(std::string* file_id) {
+  if (file_id != nullptr) {
+    
+  } else {
+    
+  }
+  _impl_.file_id_.SetAllocated(file_id, GetArenaForAllocation());
+#ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  if (_impl_.file_id_.IsDefault()) {
+    _impl_.file_id_.Set("", GetArenaForAllocation());
+  }
+#endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  // @@protoc_insertion_point(field_set_allocated:p.HistoryMessage.file_id)
+}
+
+// uint64 file_size = 12;
+inline void HistoryMessage::clear_file_size() {
+  _impl_.file_size_ = uint64_t{0u};
+}
+inline uint64_t HistoryMessage::_internal_file_size() const {
+  return _impl_.file_size_;
+}
+inline uint64_t HistoryMessage::file_size() const {
+  // @@protoc_insertion_point(field_get:p.HistoryMessage.file_size)
+  return _internal_file_size();
+}
+inline void HistoryMessage::_internal_set_file_size(uint64_t value) {
+  
+  _impl_.file_size_ = value;
+}
+inline void HistoryMessage::set_file_size(uint64_t value) {
+  _internal_set_file_size(value);
+  // @@protoc_insertion_point(field_set:p.HistoryMessage.file_size)
+}
+
+// string md5 = 13;
+inline void HistoryMessage::clear_md5() {
+  _impl_.md5_.ClearToEmpty();
+}
+inline const std::string& HistoryMessage::md5() const {
+  // @@protoc_insertion_point(field_get:p.HistoryMessage.md5)
+  return _internal_md5();
+}
+template <typename ArgT0, typename... ArgT>
+inline PROTOBUF_ALWAYS_INLINE
+void HistoryMessage::set_md5(ArgT0&& arg0, ArgT... args) {
+ 
+ _impl_.md5_.Set(static_cast<ArgT0 &&>(arg0), args..., GetArenaForAllocation());
+  // @@protoc_insertion_point(field_set:p.HistoryMessage.md5)
+}
+inline std::string* HistoryMessage::mutable_md5() {
+  std::string* _s = _internal_mutable_md5();
+  // @@protoc_insertion_point(field_mutable:p.HistoryMessage.md5)
+  return _s;
+}
+inline const std::string& HistoryMessage::_internal_md5() const {
+  return _impl_.md5_.Get();
+}
+inline void HistoryMessage::_internal_set_md5(const std::string& value) {
+  
+  _impl_.md5_.Set(value, GetArenaForAllocation());
+}
+inline std::string* HistoryMessage::_internal_mutable_md5() {
+  
+  return _impl_.md5_.Mutable(GetArenaForAllocation());
+}
+inline std::string* HistoryMessage::release_md5() {
+  // @@protoc_insertion_point(field_release:p.HistoryMessage.md5)
+  return _impl_.md5_.Release();
+}
+inline void HistoryMessage::set_allocated_md5(std::string* md5) {
+  if (md5 != nullptr) {
+    
+  } else {
+    
+  }
+  _impl_.md5_.SetAllocated(md5, GetArenaForAllocation());
+#ifdef PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  if (_impl_.md5_.IsDefault()) {
+    _impl_.md5_.Set("", GetArenaForAllocation());
+  }
+#endif // PROTOBUF_FORCE_COPY_DEFAULT_STRING
+  // @@protoc_insertion_point(field_set_allocated:p.HistoryMessage.md5)
 }
 
 // -------------------------------------------------------------------

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "epoll.h"
-#include "logging.h"
+#include "tool/logging.h"
 #include <vector>
 #include <atomic>
 #include <thread>
@@ -12,7 +12,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include "tool.h"
+#include "tool/tool.h"
 #include "thread_pool.h"
 #include "JSON/Config.h"
 
@@ -89,7 +89,8 @@ public:
         }
         
         auto conn = std::make_shared<TcpConnection>(fd);
-        conn->updateActivityTime();
+        //conn->updateActivityTime();
+        conn->setThreadPool(thread_pool_);
 
         // 使用 weak_ptr 避免循环引用
         std::weak_ptr<SubReactor> weak_self = shared_from_this();
@@ -104,6 +105,21 @@ public:
             if (self) {
                 self->removeConnection(c->fd());
             }
+        });
+
+        // 输出缓冲有/无数据时动态注册/注销 EPOLLOUT
+        conn->setEpollUpdateCallback([weak_self, fd](bool add_write) {
+            auto self = weak_self.lock();
+            if (!self) {
+                return;
+            }
+            epoll_event ev;
+            ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
+            if (add_write) {
+                ev.events |= EPOLLOUT;
+            }
+            ev.data.fd = fd;
+            epoll_ctl(self->epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
         });
         
         // 设置非阻塞
@@ -212,41 +228,51 @@ private:
                         LOG_DEBUG << "SubReactor " << id_ << " remove closed connect " << fd << "after read";
                     }
                 }
-                if (conn->isClosed() && (events[i].events & EPOLLOUT)) {
+                if (!conn->isClosed() && (events[i].events & EPOLLOUT)) {
                     conn->handleWrite();
                 }
-                if (conn->isClosed() && (events[i].events & (EPOLLERR | EPOLLHUP))) {
+                if (!conn->isClosed() && (events[i].events & (EPOLLERR | EPOLLHUP))) {
                     conn->handleClose();
                 }
             }
             // 超时检测
-            int64_t now = tool::getTimestamp();
-            if(now - last_check_time > 10000) {
-                last_check_time = now;
-                int timeout_check = Config::getInstance().getInt("server.timeout", 60);
-                std::lock_guard<std::mutex> lock(conn_mutex_);
-                for(auto it = connections_.begin(); it != connections_.end(); ) {
-                    auto& conn = it->second;
-                    if(conn && conn->isTimeout(timeout_check)) {
-                        LOG_INFO << "Connection timeout: fd = " << conn->fd();
-                        conn->handleClose();
-                        it = connections_.erase(it);
-                    }
-                    else {
-                        ++it;
-                    }
-                }
-            }
+            // int64_t now = tool::getTimestamp();
+            // if(now - last_check_time > 10000) {
+            //     last_check_time = now;
+            //     int timeout_check = Config::getInstance().getInt("server.timeout", 60);
+            //     std::vector<ConnectionPtr> timed_out;
+            //     {
+            //         std::lock_guard<std::mutex> lock(conn_mutex_);
+            //         for(auto it = connections_.begin(); it != connections_.end(); ) {
+            //             auto& conn = it->second;
+            //             if(conn && conn->isTimeout(timeout_check)) {
+            //                 LOG_INFO << "Connection timeout: fd = " << conn->fd();
+            //                 timed_out.push_back(conn);
+            //                 it = connections_.erase(it);
+            //             }
+            //             else {
+            //                 ++it;
+            //             }
+            //         }
+            //     }
+                // 锁外关闭，避免handleClose -> close_cb -> removeConnection重入死锁
+                // for(auto& conn : timed_out) {
+                //     conn->handleClose();
+                // }
+            // }
         }
         
         // 清理所有连接
         {
-            std::lock_guard<std::mutex> lock(conn_mutex_);
             std::vector<ConnectionPtr> to_close;
-            for (auto& pair : connections_) {
-                to_close.push_back(pair.second);
+            {
+                std::lock_guard<std::mutex> lock(conn_mutex_);
+                for (auto& pair : connections_) {
+                    to_close.push_back(pair.second);
+                }
+                connections_.clear();
             }
-            connections_.clear();
+            // 锁外关闭，避免handleClose -> close_cb -> removeConnection重入死锁
             for (auto& conn : to_close) {
                 conn->handleClose();
             }

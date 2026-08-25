@@ -1,14 +1,15 @@
 #pragma once
 
 #include "baseDAO.h"
-#include "../logging.h"
-#include "../tool.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
 #include <string>
 #include <vector>
 #include <map>
+#include <algorithm>
 #include "protobuf/p.h"
 #include "protobuf/mysql_p.h"
-#include "../TranscationGuard.h"
+#include "TranscationGuard.h"
 
 struct FileRecord {
     std::string file_id;
@@ -52,6 +53,7 @@ public:
         info.set_to_uid(record.to_uid);
         info.set_status(record.status);
         info.set_is_offline(record.is_offline);
+        info.set_group_id(record.group_id);
         std::string extra_json = Switch::sToJson(info);
 
         std::string sql = "INSERT INTO file_info (file_id, filename, file_size, md5, mime_type, "
@@ -65,7 +67,6 @@ public:
         sql += std::to_string(record.expire_time) + ", ";
         sql += std::to_string(record.from_uid) + ", ";
         sql += std::to_string(record.to_uid) + ", ";
-        sql += std::to_string(record.group_id) + ", ";
         sql += std::to_string(record.status) + ", '";
         sql += escapeString(extra_json) + "', '";
         sql += escapeString(record.local_path) + "', '";
@@ -117,6 +118,34 @@ public:
         }
 
         return true;
+    }
+
+    // 获取两个用户之间的私聊文件历史（按时间升序）
+    std::vector<FileRecord> getFileHistory(uint64_t user1_id, uint64_t user2_id, int limit = 100, int64_t before_time = 0) {
+        std::vector<FileRecord> records;
+
+        std::string sql = "SELECT * FROM file_info WHERE status = 1 AND ("
+                          "(from_uid = " + std::to_string(user1_id) + " AND to_uid = " + std::to_string(user2_id) + ") OR "
+                          "(from_uid = " + std::to_string(user2_id) + " AND to_uid = " + std::to_string(user1_id) + "))";
+        if(before_time > 0) {
+            sql += " AND upload_time < " + std::to_string(before_time);
+        }
+        sql += " ORDER BY upload_time DESC LIMIT " + std::to_string(limit);
+
+        std::vector<std::map<std::string, std::string>> result;
+        if(!executeQuery(sql, result)) {
+            return records;
+        }
+
+        for(const auto& row : result) {
+            FileRecord rec;
+            fillRecordFromMap(row, rec);
+            records.push_back(rec);
+        }
+
+        // 反转保持时间顺序
+        std::reverse(records.begin(), records.end());
+        return records;
     }
 
     // 更新文件状态
@@ -213,7 +242,7 @@ public:
             rec.user_id = std::stoull(row.at("user_id"));
             rec.received_at = std::stoll(row.at("received_at"));
             rec.is_downloaded = std::stoi(row.at("is_downloaded")) == 1;
-            rec.downloaded_at = std::stoll(row.at("downloaded_at"));
+            rec.downloaded_at = row.at("downloaded_at").empty() ? 0 : std::stoll(row.at("downloaded_at"));
             records.push_back(rec);
         }
         
@@ -253,7 +282,17 @@ private:
         record.expire_time = std::stoll(row.at("expire_time"));
         record.from_uid = std::stoull(row.at("from_uid"));
         record.to_uid = std::stoull(row.at("to_uid"));
-        record.group_id = std::stoull(row.at("group_id"));
+        // group_id 不存在独立列，从 extra JSON 中恢复
+        record.group_id = 0;
+        {
+            auto extra_it = row.find("extra");
+            if (extra_it != row.end() && !extra_it->second.empty()) {
+                db::FileInfo info;
+                if (Switch::dsFromJson(extra_it->second, info)) {
+                    record.group_id = info.group_id();
+                }
+            }
+        }
         record.status = std::stoi(row.at("status"));
         record.extra = row.at("extra");
         record.local_path = row.at("local_path");

@@ -4,7 +4,7 @@
 #include "userDAO.h"
 #include <vector>
 #include <map>
-#include "../TranscationGuard.h"
+#include "TranscationGuard.h"
 
 // 好友请求
 struct FriendRequest {
@@ -282,7 +282,7 @@ public:
 
     bool deleteAllFriend(uint64_t user_id) {
         char sql[512];
-        snprintf(sql, sizeof(sql), "DELETE FROM friendships WHERE user_id = %lu OR frined_id = %lu", user_id, user_id);
+        snprintf(sql, sizeof(sql), "DELETE FROM friendships WHERE user_id = %lu OR friend_id = %lu", user_id, user_id);
         return executeUpdate(sql);
     }
 

@@ -2,7 +2,7 @@
 #pragma once
 
 #include "mysql.pb.h"
-#include "../logging.h"
+#include "tool/logging.h"
 #include <string>
 #include <vector>
 #include <memory>

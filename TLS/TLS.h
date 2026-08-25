@@ -10,7 +10,7 @@
 #include <string>
 #include <memory>
 #include <vector>
-#include "../logging.h"
+#include "tool/logging.h"
 #include <arpa/inet.h>
 
 class TLSContext {
@@ -120,10 +120,8 @@ public:
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
-        if(fd_ > 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
+        // 不负责关闭 fd：fd 的生命周期由 TcpConnection 管理，避免重复 close
+        fd_ = -1;
     }
 
     int fd() const { return fd_; }
@@ -161,7 +159,7 @@ public:
             inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
         }
         
-        if(bind(listen_fd_, (sockaddr*)&addr, sizeof(addr) < 0)) {
+        if(bind(listen_fd_, (sockaddr*)&addr, sizeof(addr)) < 0) {
             LOG_ERROR << "bind failed";
             return false;
         }

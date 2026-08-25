@@ -1,8 +1,8 @@
 #pragma once
 
 #include "baseDAO.h"
-#include "../logging.h"
-#include "../tool.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -213,7 +213,7 @@ public:
 
     // 标记所有的信息为已读
     bool markAllMessagesAsRead(uint64_t to_uid) {
-        std::string sql = "UPDATE messages SET status = 2, read_at = " + std::to_string(tool::getTimestamp());
+        std::string sql = "UPDATE messages SET status = 2, read_at = " + std::to_string(tool::getTimestamp()) +
                           " WHERE to_uid = " + std::to_string(to_uid) + 
                           " AND status IN (0, 1)";
 
@@ -398,6 +398,10 @@ public:
                 continue;
             uint64_t other_uid = std::stoull(it_other->second);
             info.user_id = other_uid;
+
+            auto it_last_msg = row.find("last_msg_id");
+            info.last_msg_id = (it_last_msg != row.end() && !it_last_msg->second.empty()) 
+                               ? std::stoull(it_last_msg->second) : 0;
             
             auto it_last_time = row.find("last_time");
             info.last_msg_time = (it_last_time != row.end() && !it_last_time->second.empty()) ? std::stoll(it_last_time->second) : 0;
@@ -413,17 +417,17 @@ public:
             }
 
             // 获取最后一条消息内容
-            std::string msg_sql = "SELECT content, msg_type FROM messages WHERE msg_id = " + std::to_string(info.last_msg_id);
-            std::vector<std::map<std::string, std::string>> msg_result;
-            if(executeQuery(msg_sql, msg_result) && ! msg_result.empty()) {
-                int msg_type = std::stoi(msg_result[0]["msg_type"]);
-                if(msg_type == 1) {
-                    info.last_msg_content = msg_result[0]["content"];
-                }
-                else {
-                    info.last_msg_content = "[" +  getMessageTypeName(msg_type) + "]";
-                }
-            }
+            // std::string msg_sql = "SELECT content, msg_type FROM messages WHERE msg_id = " + std::to_string(info.last_msg_id);
+            // std::vector<std::map<std::string, std::string>> msg_result;
+            // if(executeQuery(msg_sql, msg_result) && ! msg_result.empty()) {
+            //     int msg_type = std::stoi(msg_result[0]["msg_type"]);
+            //     if(msg_type == 1) {
+            //         info.last_msg_content = msg_result[0]["content"];
+            //     }
+            //     else {
+            //         info.last_msg_content = "[" +  getMessageTypeName(msg_type) + "]";
+            //     }
+            // }
 
             // 获取未读的数量
             info.unread_count = getUnreadCount(user_id, other_uid);

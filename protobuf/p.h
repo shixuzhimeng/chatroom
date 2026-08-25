@@ -2,8 +2,8 @@
 #pragma once
 
 #include "p.pb.h"
-#include "../logging.h"
-#include "../epoll.h"
+#include "tool/logging.h"
+#include "net/epoll.h"
 #include <vector>
 #include <memory>
 #include <functional>
@@ -24,15 +24,6 @@ public:
             return {};
         }
 
-        LOG_INFO << "MessageCodec::encode: body_str.size() = " << body_str.size();
-        std::string hex;
-        for (size_t i = 0; i < std::min(body_str.size(), size_t(50)); ++i) {
-            char buf[4];
-            snprintf(buf, sizeof(buf), "%02x ", (unsigned char)body_str[i]);
-            hex += buf;
-        }
-        LOG_INFO << "MessageCodec::encode: body_str hex = " << hex;
-
         p::MessageHeader h = header;
         h.set_body_length(body_str.size());
 
@@ -41,8 +32,6 @@ public:
             LOG_ERROR << "Failed to Serialize header";
             return {};
         }
-
-        LOG_INFO << "MessageCodec::encode: after header, body_str.size() = " << body_str.size();
         
         std::vector<char> result;
         uint32_t header_len = header_str.size();
@@ -62,18 +51,11 @@ public:
         pos += header_len;
         memcpy(result.data() + pos, body_str.data(), body_len);
 
-        LOG_INFO << "encode: type=" << header.msg_type() 
-                << ", total_len=" << total_len 
-                << ", header_len=" << header_len
-                << ", body_len=" << body_len;
-
         return result;
     }
 
     // 解码
     static bool decode(const std::vector<char>& data, size_t& consumed, p::MessageHeader& header, std::vector<char>& body){
-        LOG_INFO << "decode: ENTER, data.size()=" << data.size();
-
         consumed = 0;
         body.clear();
         header.Clear();
@@ -82,9 +64,6 @@ public:
 
 
         if (data.size() < PREFIX_LEN) {
-            LOG_INFO << "decode: incomplete prefix, need="
-                    << PREFIX_LEN
-                    << ", have=" << data.size();
             return false;
         }
 
@@ -102,9 +81,6 @@ public:
         total_len = ntohl(total_len);
         header_len = ntohl(header_len);
 
-        LOG_INFO << "decode: total_len=" << total_len
-                << ", header_len=" << header_len;
-
         // 防止整数/长度异常
         if (total_len < header_len) {
             LOG_ERROR << "decode FAILED: total_len < header_len";
@@ -116,9 +92,6 @@ public:
         const size_t packet_len = PREFIX_LEN + total_len;
 
         if (data.size() < packet_len) {
-            LOG_INFO << "decode: incomplete packet, need="
-                    << packet_len
-                    << ", have=" << data.size();
             return false;
         }
 
@@ -131,10 +104,6 @@ public:
             LOG_ERROR << "decode: header ParseFromArray failed";
             return false;
         }
-
-        LOG_INFO << "decode: header parsed"
-                << ", msg_type=" << header.msg_type()
-                << ", body_length=" << header.body_length();
 
         pos += header_len;
 
@@ -156,9 +125,6 @@ public:
         }
 
         consumed = packet_len;
-
-        LOG_INFO << "decode: SUCCESS, consumed="
-                << consumed;
 
         return true;
     }

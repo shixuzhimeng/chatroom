@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 #include "baseDAO.h"
-#include "../tool.h"
+#include "tool/tool.h"
 #include "protobuf/mysql_p.h"
 
 
@@ -43,8 +43,7 @@ public:
         sql += std::to_string(user.created_at) + ", ";
         sql += std::to_string(user.updated_at) + ")";
 
-        LOG_INFO << "createUser: SQL=" << sql;
-        
+        // 不打印完整 SQL：其中包含密码哈希与盐等敏感信息
         if(executeUpdate(sql)) {
             user_id = getLastInsertID();
             return true;
@@ -201,6 +200,7 @@ private:
         user.phone = row.at("phone");
         user.nickname = row.at("nickname");
         user.avatar = row.at("avatar");
+        user.status = std::stoi(row.at("status"));
         user.created_at = std::stoll(row.at("created_at"));
         user.updated_at = std::stoll(row.at("updated_at"));
         user.settings = row.at("settings");

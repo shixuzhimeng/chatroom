@@ -8,7 +8,7 @@
 #include <memory>
 #include <chrono>
 #include <stdexcept>
-#include "../logging.h"
+#include "tool/logging.h"
 #include <utility>
 #include <functional>
 
@@ -121,6 +121,8 @@ public:
                         this->releaseConnection(conn);
                     });
                 }
+                // 坏连接将被丢弃，同步递减计数，否则 active_count_ 单调增长最终耗尽池容量
+                active_count_--;
                 try {
                     auto new_conn = createConnection();
                     return std::unique_ptr<MySQLConnection, std::function<void(MySQLConnection*)>>(new_conn.release(),

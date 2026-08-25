@@ -1,7 +1,7 @@
 #pragma once
 #include "mysql/baseDAO.h"
-#include "../logging.h"
-#include "../tool.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
 #include "protobuf/mysql_p.h"
 #include <string>
 #include <vector>

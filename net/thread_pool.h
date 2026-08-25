@@ -8,11 +8,15 @@
 #include <future>
 #include <atomic>
 #include <memory>
+#include "tool/logging.h"
 
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t threads = std::thread::hardware_concurrency()) 
+    explicit ThreadPool(size_t threads = std::thread::hardware_concurrency())
         : stop_(false) {
+        if (threads == 0) {
+            threads = 1; // hardware_concurrency() 可能返回 0
+        }
         for (size_t i = 0; i < threads; ++i) {
             workers_.emplace_back([this] {
                 while (true) {
@@ -28,7 +32,13 @@ public:
                         task = std::move(tasks_.front());
                         tasks_.pop();
                     }
-                    task();
+                    try {
+                        task();
+                    } catch (const std::exception& e) {
+                        LOG_ERROR << "ThreadPool task exception: " << e.what();
+                    } catch (...) {
+                        LOG_ERROR << "ThreadPool task unknown exception";
+                    }
                 }
             });
         }
@@ -41,8 +51,8 @@ public:
 
     template<class F, class... Args>
     auto enqueue(F&& f, Args&&... args) 
-        -> std::future<typename std::result_of<F(Args...)>::type> {
-        using return_type = typename std::result_of<F(Args...)>::type;
+        -> std::future<std::invoke_result_t<F, Args...>> {
+        using return_type = std::invoke_result_t<F, Args...>;
         
         auto task = std::make_shared<std::packaged_task<return_type()>>(
             std::bind(std::forward<F>(f), std::forward<Args>(args)...)

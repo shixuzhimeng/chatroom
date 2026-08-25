@@ -1,8 +1,8 @@
 #pragma once
 
 #include "baseDAO.h"
-#include "../logging.h"
-#include "../tool.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
 #include <string>
 #include <map>
 #include <set>
@@ -247,7 +247,7 @@ public:
                           " AND gm.user_id = " + std::to_string(user_id);
 
         std::vector<std::map<std::string, std::string>> result;
-        if(!executeQuery(sql, result)) {
+        if(!executeQuery(sql, result) || result.empty()) {
             return false;
         }
 
@@ -330,8 +330,8 @@ public:
         return isGroupOwner(group_id, user_id) || isGroupAdmin(group_id, user_id);
     }
 
-    // 入群申请
-    bool addJoinRequest(const GroupJoinRequest& request) {
+    // 入群申请（返回生成的 request_id）
+    bool addJoinRequest(const GroupJoinRequest& request, uint64_t& request_id) {
         std::string sql = "INSERT INTO group_invites (group_id, from_uid, to_uid, message, "
                           "status, created_at, updated_at) VALUES (";
         sql += std::to_string(request.group_id) + ", ";
@@ -342,7 +342,11 @@ public:
         sql += std::to_string(tool::getTimestamp()) + ", "; // created_at
         sql += std::to_string(tool::getTimestamp()) + ")";  // updated_at
 
-        return executeUpdate(sql);
+        if(!executeUpdate(sql)) {
+            return false;
+        }
+        request_id = getLastInsertID();
+        return true;
     }
 
     // 详细查看入群申请
@@ -366,7 +370,7 @@ public:
         std::string sql = "SELECT gi.*, u.username as from_username FROM group_invites gi "
                           "LEFT JOIN users u ON gi.from_uid = u.user_id "
                           "WHERE gi.group_id = " + std::to_string(group_id) + 
-                          " AND gi.status = 0 AND gi.to_uid = 0 "
+                          " AND gi.status = 0 "
                           "ORDER BY gi.created_at DESC";
 
         std::vector<std::map<std::string, std::string>> result;
