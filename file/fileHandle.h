@@ -3,8 +3,8 @@
 #include "protobuf/mysql.pb.h"
 #include "protobuf/p.h"
 #include "mysql/fileDAO.h"
-#include "../logging.h"
-#include "../tool.h"
+#include "tool/logging.h"
+#include "tool/tool.h"
 #include "epoll.h"
 #include "fileManage.h"
 #include <unordered_map>
@@ -13,6 +13,7 @@
 #include <vector>
 #include "mysql/messageDAO.h"
 #include "mysql/groupmessageDAO.h"
+#include <groupDAO.h>
 
 // 文件传输会话
 struct FileSession {
@@ -84,54 +85,125 @@ public:
         // MD5去重
         FileDAO dao;
         FileRecord existing;
-        bool is_duplicate = false;
         std::string existing_file_id;
 
         if(!info.md5().empty()) {
-            if(dao.getFileByMD5(info.md5(), existing)) {
-                is_duplicate = true;
+            // 仅当数据库中已存在同 MD5 记录、且其物理文件确实存在时才视为重复
+            if(dao.getFileByMD5(info.md5(), existing) && manage_.fileExists(existing.file_id)) {
                 existing_file_id = existing.file_id;
-                LOG_INFO << "Duplicate file deceted, MD5: " << info.md5() << " ,existing file: " << existing.file_id;
+                LOG_INFO << "Duplicate file detected, MD5: " << info.md5() << ", existing file: " << existing.file_id;
 
-                // 如果文件重复，则将直接使用现存的文件
-                db::FileUploadResp duplicate_resp;
-                duplicate_resp.set_success(true);
-                duplicate_resp.set_file_id(existing_file_id);
-                duplicate_resp.set_message("File already exixts, using existing copy");
-                duplicate_resp.set_uploaded_size(existing.file_size);
-                duplicate_resp.set_is_duplicate(true);
-                duplicate_resp.set_existing_file_id(existing_file_id);
+                // 判断是否已存在"相同发送者 + 相同接收方"的投递记录
+                bool same_delivery = (existing.from_uid == from_uid) &&
+                                     (existing.to_uid == info.to_uid()) &&
+                                     (existing.group_id == group_id);
 
-                p::MessageHeader resp_header;
-                resp_header.set_msg_id(header.msg_id() + 1);
-                resp_header.set_msg_type(p::MSG_FILE_UPLOAD_RESP);
-                resp_header.set_timestamp(tool::getTimestamp());
-            
-                auto data = proto::MessageCodec::encode(resp_header, duplicate_resp);
-                if(!data.empty()) {
-                    conn->send(data.data(), data.size());
-                }
+                if(same_delivery) {
+                    // 完全重复：复用已有记录，仅通知接收方
+                    db::FileUploadResp duplicate_resp;
+                    duplicate_resp.set_success(true);
+                    duplicate_resp.set_file_id(existing_file_id);
+                    duplicate_resp.set_message("已有相同文件: " + existing_file_id);
+                    duplicate_resp.set_uploaded_size(existing.file_size);
+                    duplicate_resp.set_is_duplicate(true);
+                    duplicate_resp.set_existing_file_id(existing_file_id);
+
+                    p::MessageHeader resp_header;
+                    resp_header.set_msg_id(header.msg_id() + 1);
+                    resp_header.set_msg_type(p::MSG_FILE_UPLOAD_RESP);
+                    resp_header.set_timestamp(tool::getTimestamp());
                 
-                // 创建文件只想已有的文件
-                FileRecord new_record = existing;
-                new_record.file_id = file_id;
-                new_record.from_uid = from_uid;
-                new_record.to_uid = info.to_uid();
-                new_record.is_offline = false;
-                // 复制文件
-                if(manage_.copyFile(existing_file_id, file_id)) {
-                    dao.insertFile(new_record);
+                    auto data = proto::MessageCodec::encode(resp_header, duplicate_resp);
+                    if(!data.empty()) {
+                        conn->send(data.data(), data.size());
+                    }
+
+                    FileRecord notify_record = existing;
+                    notify_record.from_uid = from_uid;
+                    notify_record.to_uid = info.to_uid();
+                    notify_record.group_id = group_id;
+                    notify_record.is_offline = false;
                     if(is_group_chat) {
-                        sendFileMessage(new_record, header);
+                        sendGroupFileMessage(notify_record, group_id);
+                    }
+                    else {
+                        sendFileMessage(notify_record, header);
+                    }
+                }
+                else {
+                    // 相同内容投递给新接收方：新建记录并硬链接复用物理文件，确保新接收方能下载
+                    std::string ext;
+                    size_t dot = info.filename().find_last_of('.');
+                    if(dot != std::string::npos && dot + 1 < info.filename().size()) {
+                        ext = info.filename().substr(dot + 1);
+                    }
+
+                    std::string new_file_id = manage_.generateFileID();
+
+                    FileRecord new_record = existing;
+                    new_record.file_id = new_file_id;
+                    new_record.filename = info.filename();
+                    new_record.file_size = info.file_size();
+                    new_record.md5 = info.md5();
+                    new_record.mime_type = info.mime_type();
+                    new_record.upload_time = tool::getTimestamp();
+                    new_record.expire_time = new_record.upload_time + 7 * 24 * 3600 * 1000;
+                    new_record.from_uid = from_uid;
+                    new_record.to_uid = info.to_uid();
+                    new_record.group_id = group_id;
+                    new_record.status = 1;   // 直接复用已有物理文件，视为完成
+                    new_record.is_offline = false;
+                    new_record.local_path = manage_.getFilePathWithExt(new_file_id, ext);
+
+                    std::string src_path = manage_.getFilePath(existing_file_id); // 能正确找到源文件（带扩展名）
+                    std::string dst_path = manage_.getFilePathWithExt(new_file_id, ext);
+
+                    std::error_code ec;
+                    std::filesystem::create_hard_link(src_path, dst_path, ec);
+                    if (ec) {
+                        // 硬链接失败（如跨设备），回退为复制
+                        LOG_WARN << "Hard link failed, fallback to copy: " << ec.message();
+                        std::filesystem::copy_file(src_path, dst_path, std::filesystem::copy_options::overwrite_existing, ec);
+                        if (ec) {
+                            LOG_ERROR << "Failed to copy file for deduplication: " << ec.message();
+                            sendFileResponse(conn, header, false, "File copy failed");
+                            return;
+                        }
+                        LOG_INFO << "File copied (fallback): " << src_path << " -> " << dst_path;
+                    } else {
+                        LOG_INFO << "File linked: " << src_path << " -> " << dst_path;
+                    }
+
+                    if(!dao.insertFile(new_record)) {
+                        sendFileResponse(conn, header, false, "Database error");
+                        return;
+                    }
+
+                    if(is_group_chat) {
+                        sendGroupFileMessage(new_record, group_id);
                     }
                     else {
                         sendFileMessage(new_record, header);
                     }
-                }
-                else {
-                    LOG_ERROR << "Failed to copy file for deduplication: " << existing_file_id;
-                    sendFileResponse(conn, header, false, "File copy failed");
-                    return;
+
+                    // 告知客户端新文件 ID
+                    db::FileUploadResp duplicate_resp;
+                    duplicate_resp.set_success(true);
+                    duplicate_resp.set_file_id(new_file_id);
+                    duplicate_resp.set_message("已有相同文件: " + existing_file_id);
+                    duplicate_resp.set_uploaded_size(existing.file_size);
+                    duplicate_resp.set_is_duplicate(true);
+                    duplicate_resp.set_existing_file_id(existing_file_id);
+
+                    p::MessageHeader resp_header;
+                    resp_header.set_msg_id(header.msg_id() + 1);
+                    resp_header.set_msg_type(p::MSG_FILE_UPLOAD_RESP);
+                    resp_header.set_timestamp(tool::getTimestamp());
+                
+                    auto data = proto::MessageCodec::encode(resp_header, duplicate_resp);
+                    if(!data.empty()) {
+                        conn->send(data.data(), data.size());
+                    }
                 }
                 return ;
             }
@@ -153,7 +225,12 @@ public:
         record.to_uid = info.to_uid();
         record.group_id = group_id; 
         record.status = 0;
-        record.local_path = manage_.getFilePath(file_id);
+        std::string ext;
+        size_t dot = info.filename().find_last_of('.');
+        if (dot != std::string::npos && dot + 1 < info.filename().size()) {
+            ext = info.filename().substr(dot + 1);
+        }
+        record.local_path = manage_.getFilePathWithExt(file_id, ext);
         record.is_offline = false;
 
         if(!exists) {
@@ -209,6 +286,11 @@ public:
 
     // 文件传输块
     void handleFileUploadChunk(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        uint64_t user_id = conn->getUserID();
+        // if(user_id  > 0) {
+        //     OnlineManager::getInstance().updateHeartbeat(user_id);
+        // }
+
         db::FileUploadChunk chunk;
         if(!chunk.ParseFromArray(body.data(), body.size())) {
             LOG_ERROR << "Parse chunk failed";
@@ -240,6 +322,7 @@ public:
 
         // 如果是最后一块，完成上传
         if(chunk.is_last()) {
+            //OnlineManager::getInstance().updateHeartbeat(user_id);
             std::string expected_md5;
             FileDAO dao;
             FileRecord record;
@@ -247,10 +330,16 @@ public:
                 expected_md5 = record.md5;
             }
 
-            if(manage_.completeUpload(file_id, expected_md5)) {
+            std::string ext;
+            size_t dot = record.filename.find_last_of('.');
+            if (dot != std::string::npos && dot + 1 < record.filename.size()) {
+                ext = record.filename.substr(dot + 1);
+            }
+
+            if(manage_.completeUpload(file_id, expected_md5, ext)) {
                 // 更新数据库状态
                 dao.updateFileStatus(file_id, 1);
-                dao.updateFilePath(file_id, manage_.getFilePath(file_id));
+                dao.updateFilePath(file_id, manage_.getFilePathWithExt(file_id, ext));
 
                 // 获取完整的文件信息
                 if(dao.getFileByID(file_id, record)) {
@@ -304,15 +393,34 @@ public:
         }
     }
 
+    void markConnectionBusy(uint64_t user_id) {
+        std::lock_guard<std::mutex> lock(busy_mutex_);
+        busy_connections_.insert(user_id);
+    }
+
+    void markConnectionIdle(uint64_t user_id) {
+        std::lock_guard<std::mutex> lock(busy_mutex_);
+        busy_connections_.erase(user_id);
+    }
+
+    bool isConnectionBusy(uint64_t user_id) {
+        std::lock_guard<std::mutex> lock(busy_mutex_);
+        return busy_connections_.find(user_id) != busy_connections_.end();
+    }
+
     // 文件的下载请求
     void handleFileDownloadReq(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, const std::vector<char>& body) {
+        uint64_t user_id = conn->getUserID();
+        // if(user_id > 0) {
+        //     OnlineManager::getInstance().updateHeartbeat(user_id);
+        // }
+        
         db::FileDownloadReq req;
         if(!req.ParseFromArray(body.data(), body.size())) {
             sendFileResponse(conn, header, false, "Invalid request");
             return ;
         }
 
-        uint64_t user_id = conn->getUserID();
         if(user_id == 0) {
             sendFileResponse(conn, header, false, "User not logged in");
             return ;
@@ -390,25 +498,36 @@ public:
             conn->send(data.data(), data.size());
         }
 
-        // 标记离线文件已下载
-        if(record.is_offline) {
-            dao.markOfflineFileDownLoaded(file_id, user_id);
-        }
+        markConnectionBusy(user_id);
 
-        // 开始传输文件块
-        sendNextChunk(conn, file_id, offset);
+        // 在独立线程中传输文件块，避免阻塞 reactor 线程导致心跳无法处理
+        std::thread([this, conn, file_id, offset, file_size]() {
+            //OnlineManager::getInstance().updateHeartbeat(conn->getUserID());
+            sendNextChunk(conn, file_id, offset, file_size);
+            //OnlineManager::getInstance().updateHeartbeat(conn->getUserID());
+        }).detach();
 
         LOG_INFO << "File download started: " << file_id << " for user " << user_id << ", offset: " << offset;
     }
 
-    // 发送文件块
-    void sendNextChunk(std::shared_ptr<TcpConnection> conn, const std::string& file_id, uint64_t offset) {
+    // 发送文件块（独立线程中执行，带背压；输出缓冲满时短暂休眠等待刷出）
+    void sendNextChunk(std::shared_ptr<TcpConnection> conn, const std::string& file_id, uint64_t offset, uint64_t file_size) {
         const uint32_t CHUNK_SIZE = 64 * 1024;
+        const size_t MAX_BUFFERED = 256 * 1024;
+        uint64_t user_id = conn->getUserID();
+        const int CHUNKS_PER_HEARTBEAT = 20;
+        //int heartbeat_chunk = 0;
 
         while (true) {
             if (!conn || conn->isClosed()) {
                 LOG_ERROR << "Connection closed during download: " << file_id;
-                break;
+                {
+                    std::lock_guard<std::mutex> lock(sessions_mutex_);
+                    download_sessions_.erase(file_id);
+                }
+                manage_.closeReadFile(file_id);
+                markConnectionIdle(user_id);
+                return;
             }
 
             std::string chunk_data;
@@ -425,7 +544,8 @@ public:
             chunk.set_chunk_index(chunk_index);
             chunk.set_offset(offset);
             chunk.set_data(chunk_data);
-            chunk.set_is_last(chunk_data.size() < CHUNK_SIZE);
+            // 根据剩余字节数判定最后一块，正确处理文件大小为块大小整数倍的情况
+            chunk.set_is_last(offset + chunk_data.size() >= file_size);
 
             p::MessageHeader header;
             header.set_msg_type(p::MSG_FILE_DOWNLOAD_CHUNK);
@@ -452,12 +572,40 @@ public:
                     std::lock_guard<std::mutex> lock(sessions_mutex_);
                     download_sessions_.erase(file_id);
                 }
-                break;
+                manage_.closeReadFile(file_id);
+                markConnectionIdle(user_id);
+
+                // 传输完整完成后才标记离线文件已下载，避免中断导致无法重试
+                FileDAO file_dao;
+                file_dao.markOfflineFileDownLoaded(file_id, user_id);
+                return;
             }
 
             offset += chunk_data.size();
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+            // 背压：输出缓冲超过阈值则休眠等待 reactor 刷出，避免内存暴涨
+            while (conn->outputBufferSize() > MAX_BUFFERED) {
+                if (conn->isClosed()) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+
+            // heartbeat_chunk++;
+            // if (heartbeat_chunk >= CHUNKS_PER_HEARTBEAT) {
+            //     //OnlineManager::getInstance().updateHeartbeat(user_id);
+            //     conn->updateActivityTime();
+            //     heartbeat_chunk = 0;
+            // }
         }
+
+        // 提前读到 EOF（理论上 is_last 已覆盖），按完成收尾
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            download_sessions_.erase(file_id);
+        }
+        manage_.closeReadFile(file_id);
+        markConnectionIdle(user_id);
     }
 
     // 发送文件消息给接收方
@@ -588,8 +736,10 @@ public:
                 resp.set_message("Resume download");
             }
             else {
-                resp.set_success(false);
-                resp.set_message("No downlaod session");
+                // 没有进行中的下载会话，属于全新下载，从偏移 0 开始
+                resp.set_success(true);
+                resp.set_offset(0);
+                resp.set_message("No download session, start from 0");
             }
         }
 
@@ -668,6 +818,8 @@ private:
     std::mutex sessions_mutex_;
     std::unordered_map<std::string, FileSession> upload_sessions_;
     std::unordered_map<std::string, FileSession> download_sessions_;
+    std::mutex busy_mutex_;
+    std::unordered_set<uint64_t> busy_connections_;
 
 
     void sendFileResponse(std::shared_ptr<TcpConnection> conn, const p::MessageHeader& header, bool success, const std::string& msg) {

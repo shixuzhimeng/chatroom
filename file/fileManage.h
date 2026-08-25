@@ -6,8 +6,11 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
-#include "../logging.h"
-#include "../tool.h"
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include "tool/logging.h"
+#include "tool/tool.h"
 #include "mysql/fileDAO.h"
 #include "md5.h"
 class FileManage {
@@ -50,13 +53,19 @@ public:
             std::filesystem::path temp_path = base_path / "temp";
             std::filesystem::path store_path = base_path / "store";
 
-            if(!std::filesystem::create_directories(temp_path)) {
-                LOG_ERROR << "Failed to create temp directory: " << temp_path;
+            // create_directories 在目录已存在时返回 false（非错误），需用 error_code 判断真实失败
+            std::error_code ec;
+            std::filesystem::create_directories(temp_path, ec);
+            if(ec || !std::filesystem::is_directory(temp_path)) {
+                LOG_ERROR << "Failed to create temp directory: " << temp_path
+                          << (ec ? " (" + ec.message() + ")" : "");
                 return false;
             }
 
-            if(!std::filesystem::create_directories(store_path)) {
-                LOG_ERROR << "Failed to create store directory: " << store_path;
+            std::filesystem::create_directories(store_path, ec);
+            if(ec || !std::filesystem::is_directory(store_path)) {
+                LOG_ERROR << "Failed to create store directory: " << store_path
+                          << (ec ? " (" + ec.message() + ")" : "");
                 return false;
             }
 
@@ -82,7 +91,25 @@ public:
 
     // 获取文件的完整的路径（磁盘中的正式目录）
     std::string getFilePath(const std::string& file_id) {
-        return  store_dir_ + "/" + file_id;
+        std::string path_no_ext = store_dir_ + "/" + file_id;
+        if (std::filesystem::exists(path_no_ext)) {
+            return path_no_ext;
+        }
+        // 查找以 file_id 开头且后面紧跟 '.' 的文件
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(store_dir_, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            std::string name = entry.path().filename().string();
+            if (name.rfind(file_id, 0) == 0 && name.size() > file_id.size() && name[file_id.size()] == '.') {
+                return entry.path().string();
+            }
+        }
+        return path_no_ext;  // 找不到就返回无扩展名路径（文件不存在）
+    }
+
+    std::string getFilePathWithExt(const std::string& file_id, const std::string& ext) {
+        return store_dir_ + "/" + file_id + (ext.empty() ? "" : "." + ext);
     }
 
     // 获取临时目录
@@ -105,29 +132,60 @@ public:
     }
 
 
-    // 临时传输文件
+    // 临时传输文件（复用已打开的文件句柄，避免每块重复 open/close）
     bool saveChunk(const std::string& file_id, uint64_t offset, const std::string& data) {
-        std::string path = getTempPath(file_id);
-        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        std::lock_guard<std::mutex> lock(streams_mutex_);
 
-        if(!file) {
-            file.open(path, std::ios::binary | std::ios::out);
-            if(!file) {
-                LOG_ERROR << "Failed to create temp file: " << path;
-                return false;
+        auto it = temp_streams_.find(file_id);
+        if (it == temp_streams_.end()) {
+            std::string path = getTempPath(file_id);
+            std::fstream fs(path, std::ios::binary | std::ios::in | std::ios::out);
+            if (!fs) {
+                // 文件尚不存在（新上传），用 out 模式创建
+                fs.clear();
+                fs.open(path, std::ios::binary | std::ios::out);
+                if (!fs) {
+                    LOG_ERROR << "Failed to create temp file: " << path;
+                    return false;
+                }
             }
+            it = temp_streams_.emplace(file_id, std::move(fs)).first;
         }
+
+        std::fstream& file = it->second;
+
+        // 校验 offset 连续性（以流当前写位置为准，避免每块 stat）
+        file.seekp(0, std::ios::end);
+        uint64_t cur_size = static_cast<uint64_t>(file.tellp());
+        if (offset != cur_size) {
+            LOG_ERROR << "Invalid chunk offset: expected " << cur_size << ", got " << offset;
+            return false;
+        }
+
         file.seekp(offset);
         file.write(data.data(), data.size());
-        file.flush();
-        
+        if (!file) {
+            LOG_ERROR << "Failed to write chunk for file: " << file_id;
+            return false;
+        }
+
         return true;
     }
 
     // 将临时文件存储到最终的存储位置并且验证MD5
-    bool completeUpload(const std::string& file_id, const std::string& expected_md5) {
+    bool completeUpload(const std::string& file_id, const std::string& expected_md5, const std::string& ext = "") {
+        // 关闭并移除已打开的上传临时文件句柄，确保数据落盘后可被 rename
+        {
+            std::lock_guard<std::mutex> lock(streams_mutex_);
+            auto it = temp_streams_.find(file_id);
+            if (it != temp_streams_.end()) {
+                it->second.close();
+                temp_streams_.erase(it);
+            }
+        }
+
         std::string temp_path = getTempPath(file_id);
-        std::string store_path = getFilePath(file_id);
+        std::string store_path = getFilePathWithExt(file_id, ext);
 
         // 计算临时文件的MD5
         std::string actual_md5 = MD5Tool::calculateFile(temp_path);
@@ -183,20 +241,30 @@ public:
     }
 
 
-    // 获取指定的文件块
+    // 获取指定的文件块（复用打开的文件句柄，避免每块重复 open/close）
     bool readChunk(const std::string& file_id, uint64_t offset, uint32_t size, std::string& data) {
         if (size == 0) {  // 读0字节逻辑上算成功
             data.clear();
             return true;
         }
 
-        std::string path = getFilePath(file_id);
-        std::ifstream file(path, std::ios::binary);
-        if (!file) {
-            LOG_ERROR << "File not found: " << path;
-            return false;
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+
+        auto it = read_streams_.find(file_id);
+        if (it == read_streams_.end()) {
+            std::string path = getFilePath(file_id);
+            std::ifstream fs(path, std::ios::binary);
+            if (!fs) {
+                LOG_ERROR << "File not found: " << path;
+                return false;
+            }
+            it = read_streams_.emplace(file_id, std::move(fs)).first;
         }
 
+        std::ifstream& file = it->second;
+
+        // 清除可能残留的 eof 状态位，便于断点续传时再次 seek
+        file.clear();
         file.seekg(offset);
         if (!file) {
             LOG_ERROR << "Seek to offset " << offset << " failed";
@@ -210,20 +278,30 @@ public:
         data.resize(static_cast<size_t>(bytes_read));
 
         if (file.bad()) {
-            LOG_ERROR << "I/O error while reading file: " << path;
+            LOG_ERROR << "I/O error while reading file: " << getFilePath(file_id);
             return false;
         }
 
         if (bytes_read == 0) {
-            LOG_ERROR << "Read 0 bytes from offset " << offset << " (file may be empty or EOF)";
-            return false;
+            // 到达文件末尾，返回空数据
+            return true;
         }
 
         return true;
     }
 
-    // 复制文件(用于去重)
-    bool copyFile(const std::string& src_file_id, const std::string& dst_file_id) {
+    // 关闭下载读取句柄
+    void closeReadFile(const std::string& file_id) {
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+        auto it = read_streams_.find(file_id);
+        if (it != read_streams_.end()) {
+            it->second.close();
+            read_streams_.erase(it);
+        }
+    }
+
+    // 硬链接文件(用于去重)：磁盘上只保留一份物理文件，多个文件ID共享同一inode
+    bool linkFile(const std::string& src_file_id, const std::string& dst_file_id) {
         std::string src_path = getFilePath(src_file_id); 
         std::string dst_path = getFilePath(dst_file_id); 
 
@@ -232,15 +310,26 @@ public:
             return false;
         }
 
-        try {
-            std::filesystem::copy_file(src_path, dst_path);
-            LOG_INFO << "file copied: " << src_path << " -> " << dst_path;
+        std::error_code ec;
+        std::filesystem::create_hard_link(src_path, dst_path, ec);
+        if(!ec) {
+            LOG_INFO << "file linked: " << src_path << " -> " << dst_path;
             return true;
+        }
+
+        // 硬链接失败(如跨文件系统)，退化为复制
+        try {
+            std::filesystem::copy_file(src_path, dst_path, std::filesystem::copy_options::overwrite_existing, ec);
+            if(!ec) {
+                LOG_INFO << "file copied (fallback): " << src_path << " -> " << dst_path;
+                return true;
+            }
         }
         catch(const std::exception& e) {
             LOG_ERROR << "Failed to copy file: " << e.what();
             return false;
         }
+        return false;
     } 
 
     // 获取已上传文件的大小
@@ -255,6 +344,20 @@ public:
 
     // 删除文件
     bool deleteFile(const std::string& file_id, bool delete_db = true) {
+        {
+            std::lock_guard<std::mutex> lock(streams_mutex_);
+            auto t = temp_streams_.find(file_id);
+            if (t != temp_streams_.end()) {
+                t->second.close();
+                temp_streams_.erase(t);
+            }
+            auto r = read_streams_.find(file_id);
+            if (r != read_streams_.end()) {
+                r->second.close();
+                read_streams_.erase(r);
+            }
+        }
+
         std::string path = getFilePath(file_id);
         if(std::filesystem::exists(path)) {
             std::filesystem::remove(path);
@@ -310,9 +413,18 @@ public:
         // 设置后台运行
         cleaner_running_ = true;
         cleaner_thread_ = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(cleaner_mutex_);
             while(cleaner_running_) {
-                std::this_thread::sleep_for(std::chrono::hours(1)); // 每隔1小时执行一次
+                // 可被 stopCleaner 唤醒，避免关闭时 join 阻塞长达 1 小时
+                cleaner_cv_.wait_for(lock, std::chrono::hours(1), [this]() {
+                    return !cleaner_running_;
+                });
+                if(!cleaner_running_) {
+                    break;
+                }
+                lock.unlock();
                 cleanExpiredFiles();  // 执行清理文件
+                lock.lock();
             }
         });
         LOG_INFO << "File cleaner start";
@@ -320,7 +432,11 @@ public:
 
     // 停止后台线程
     void stopCleaner() {
-        cleaner_running_ = false;
+        {
+            std::lock_guard<std::mutex> lock(cleaner_mutex_);
+            cleaner_running_ = false;
+        }
+        cleaner_cv_.notify_all();
         if(cleaner_thread_.joinable()) {
             cleaner_thread_.join();
         }
@@ -333,4 +449,11 @@ private:
     int expired_days_;
     std::atomic<bool> cleaner_running_{false};
     std::thread cleaner_thread_;
+    std::mutex cleaner_mutex_;
+    std::condition_variable cleaner_cv_;
+
+    // 复用已打开的文件句柄，避免每块重复 open/close
+    std::mutex streams_mutex_;
+    std::unordered_map<std::string, std::fstream> temp_streams_;
+    std::unordered_map<std::string, std::ifstream> read_streams_;
 };
