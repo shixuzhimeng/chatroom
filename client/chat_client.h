@@ -8,11 +8,15 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <condition_variable>
 #include <fstream>
+#include <filesystem>
+#include <cctype>
+#include <unordered_map>
 #include "TLSclient.h"
 #include "protobuf/p.h"
 #include "protobuf/mysql_p.h"
-#include "../tool.h"
+#include "tool/tool.h"
 #include "file/md5.h"
 
 struct UserInfo {
@@ -34,7 +38,7 @@ struct ConversationInfo {
     int online_status = 0;  // 0=离线, 1=在线
 };
 
-// 断点续传异步等待相关
+// 断点续传
 struct ResumeResult {
     bool success = false;
     uint64_t offset = 0;
@@ -43,7 +47,9 @@ struct ResumeResult {
 
 struct UploadMetaResult {
     bool success = false;
+    bool is_duplicate = false;
     std::string file_id;
+    std::string existing_file_id;
     uint64_t resume_offset = 0;
     std::string error_msg;
 };
@@ -64,71 +70,113 @@ public:
     }
 
     bool connect(const std::string& host, uint16_t port, bool use_tls, const std::string cert_file, const std::string& key_file) {
+        host_ = host;
+        port_ = port;
+        use_tls_ = use_tls;
+        cert_file_ = cert_file;
+        key_file_ = key_file;
         if(client_->connect(host, port, use_tls, cert_file, key_file)) {
             connected_ = true;
             running = true;
             recv_thread_ = std::thread(&ChatClient::receiveloop, this);
-            startPreLoginHeartbeat();
+            //startPreLoginHeartbeat();
+            return true;
+        }
+        return false;
+    }
+
+    // 断线重连（连接被服务端超时关闭后，再次操作前自动重连）
+    bool reconnect() {
+        if(client_->isConnected()) {
+            return true;
+        }
+        if(host_.empty()) {
+            return false;
+        }
+        // 清理旧的接收线程
+        if(recv_thread_.joinable()) {
+            recv_thread_.join();
+        }
+        if(client_->connect(host_, port_, use_tls_, cert_file_, key_file_)) {
+            connected_ = true;
+            running = true;
+            recv_thread_ = std::thread(&ChatClient::receiveloop, this);
+            //startPreLoginHeartbeat();
+            LOG_INFO << "Reconnected to " << host_ << ":" << port_;
             return true;
         }
         return false;
     }
 
     void disconnect() {
+        cleanChatMod();
         connected_ = false;
         running = false;
         if(recv_thread_.joinable()) {
             recv_thread_.join();
         }
-        stopHeartbeat();
-        stopPreLoginHeartbeat();
+        //stopHeartbeat();
+        //stopPreLoginHeartbeat();
         client_->disconnect();
         user_.logged_in = false;
     }
 
-    void startPreLoginHeartbeat() {
-        if (pre_login_heartbeat_running_) {
-            return;
-        }
-        pre_login_heartbeat_running_ = true;
-        pre_login_heartbeat_thread_ = std::thread([this]() {
-            while (pre_login_heartbeat_running_ && !user_.logged_in && client_->isConnected()) {
-                std::this_thread::sleep_for(std::chrono::seconds(10));
-                if (!user_.logged_in && client_->isConnected()) {
-                    sendPreLoginHeartbeat();
-                }
-            }
-            LOG_DEBUG << "Pre-login heartbeat thread exiting";
-        });
-    }
+    // void startPreLoginHeartbeat() {
+    //     if (pre_login_heartbeat_running_) {
+    //         return;
+    //     }
+    //     pre_login_heartbeat_running_ = true;
+    //     pre_login_heartbeat_thread_ = std::thread([this]() {
+    //         std::unique_lock<std::mutex> lock(pre_login_mutex_);
+    //         while (pre_login_heartbeat_running_ && !user_.logged_in && client_->isConnected()) {
+    //             // 可被 stopPreLoginHeartbeat 唤醒，避免关闭时 join 阻塞 10 秒
+    //             pre_login_cv_.wait_for(lock, std::chrono::seconds(10), [this] {
+    //                 return !pre_login_heartbeat_running_;
+    //             });
+    //             if (!pre_login_heartbeat_running_) {
+    //                 break;
+    //             }
+    //             lock.unlock();
+    //             if (!user_.logged_in && client_->isConnected()) {
+    //                 sendPreLoginHeartbeat();
+    //             }
+    //             lock.lock();
+    //         }
+    //         LOG_DEBUG << "Pre-login heartbeat thread exiting";
+    //     });
+    // }
 
-    void stopPreLoginHeartbeat() {
-        pre_login_heartbeat_running_ = false;
-        if (pre_login_heartbeat_thread_.joinable()) {
-            pre_login_heartbeat_thread_.join();
-        }
-    }
+    // void stopPreLoginHeartbeat() {
+    //     {
+    //         std::lock_guard<std::mutex> lock(pre_login_mutex_);
+    //         pre_login_heartbeat_running_ = false;
+    //     }
+    //     pre_login_cv_.notify_all();
+    //     if (pre_login_heartbeat_thread_.joinable()) {
+    //         pre_login_heartbeat_thread_.join();
+    //     }
+    // }
 
-    void sendPreLoginHeartbeat() {
-        if(!client_->isConnected()) {
-            return;
-        }
+    // void sendPreLoginHeartbeat() {
+    //     if(!client_->isConnected()) {
+    //         return;
+    //     }
         
-        p::Heartbeat hb;
-        hb.set_timestamp(tool::getTimestamp());
-        hb.set_client_time(tool::getTimestamp());
-        hb.set_seq(0);  // seq=0 表示登录前心跳
+    //     p::Heartbeat hb;
+    //     hb.set_timestamp(tool::getTimestamp());
+    //     hb.set_client_time(tool::getTimestamp());
+    //     hb.set_seq(0);  // seq=0 表示登录前心跳
 
-        p::MessageHeader header;
-        header.set_msg_type(p::MSG_HEARTBEAT);
-        header.set_timestamp(tool::getTimestamp());
+    //     p::MessageHeader header;
+    //     header.set_msg_type(p::MSG_HEARTBEAT);
+    //     header.set_timestamp(tool::getTimestamp());
 
-        auto data = proto::MessageCodec::encode(header, hb);
-        if(!data.empty()) {
-            sendData(data);
-            LOG_DEBUG << "Pre-login heartbeat sent";
-        }
-    }
+    //     auto data = proto::MessageCodec::encode(header, hb);
+    //     if(!data.empty()) {
+    //         sendData(data);
+    //         LOG_DEBUG << "Pre-login heartbeat sent";
+    //     }
+    // }
 
 
     void receiveloop() {
@@ -158,9 +206,11 @@ public:
             int n = epoll_wait(epoll_fd_, events, 10, 1000);
             if(n < 0) {
                 if(errno == EINTR) {
-                    LOG_ERROR << "epoll_wait error: " << strerror(errno);
-                    break;
+                    // 信号打断不应终止接收循环
+                    continue;
                 }
+                LOG_ERROR << "epoll_wait error: " << strerror(errno);
+                break;
             }
             if(n == 0) {
                 if(!client_->isConnected()) {
@@ -180,6 +230,15 @@ public:
         if(epoll_fd_ > 0) {
             close(epoll_fd_);
             epoll_fd_ = -1;
+        }
+
+        // 连接被动断开（如被服务端单点登录踢下线）时，标记离线并通知 UI
+        connected_ = false;
+        if(user_.logged_in) {
+            user_.logged_in = false;
+            if(msg_callback_) {
+                msg_callback_("[系统] 与服务器的连接已断开，请重新登录");
+            }
         }
 
         LOG_INFO << "Receive loop exited";
@@ -235,24 +294,41 @@ public:
                 }
                 break;
             }
+            case p::MSG_GROUP_CREATE:
+            {
+                // 创建群组响应（携带 group_id）
+                p::CreateGroupResponse createResp;
+                if (createResp.ParseFromArray(body.data(), body.size())) {
+                    if (msg_callback_) {
+                        if (createResp.success()) {
+                            std::string msg = "\n 群组创建成功！";
+                            msg += "\n   群组ID: " + std::to_string(createResp.group_id());
+                            if (!createResp.message().empty()) {
+                                msg += "\n   消息: " + createResp.message();
+                            }
+                            msg_callback_(msg);
+                        } else {
+                            msg_callback_("[失败] 群组创建失败: " + createResp.message());
+                        }
+                    }
+                    getGroupList();
+                } else {
+                    LOG_ERROR << "Failed to parse CreateGroupResponse";
+                }
+                break;
+            }
             case p::MSG_GROUP_NOTIFICATION:
             {
                 LOG_DEBUG << "Processing MSG_GROUP_NOTIFICATION (type=28)";
                 LOG_DEBUG << "body.size() = " << body.size();
                 
-                // 先尝试解析为 CreateGroupResponse
-                p::CreateGroupResponse createResp;
-                if (createResp.ParseFromArray(body.data(), body.size()) && createResp.group_id() > 0) {
-                    LOG_DEBUG << "Parsed as CreateGroupResponse: group_id=" << createResp.group_id();
+                // 尝试解析为 GroupNotification
+                p::GroupNotification notify;
+                if (notify.ParseFromArray(body.data(), body.size())) {
+                    LOG_DEBUG << "Parsed as GroupNotification: " << notify.message();
                     if (msg_callback_) {
-                        std::string msg = "\n 群组创建成功！";
-                        msg += "\n   群组ID: " + std::to_string(createResp.group_id());
-                        if (!createResp.message().empty()) {
-                            msg += "\n   消息: " + createResp.message();
-                        }
-                        msg_callback_(msg);
+                        msg_callback_("[群组通知] " + notify.message());
                     }
-                    getGroupList();
                     break;
                 }
                 
@@ -272,21 +348,11 @@ public:
                     break;
                 }
                 
-                // 尝试解析为 GroupNotification
-                p::GroupNotification notify;
-                if (notify.ParseFromArray(body.data(), body.size())) {
-                    LOG_DEBUG << "Parsed as GroupNotification: " << notify.message();
-                    if (msg_callback_) {
-                        msg_callback_("[群组通知] " + notify.message());
-                    }
-                    break;
-                }
-                
                 LOG_ERROR << "Failed to parse type=28 message, body size=" << body.size();
                 break;
             }
             case p::MSG_GROUP_CHAT: {
-                // 尝试用第一种结构体解析 (用于在线消息)
+                // 尝试用于在线消息
                 p::GroupMessagePush online_push;
                 if (online_push.ParseFromArray(body.data(), body.size())) {
                     LOG_DEBUG << "=== Direct field values ===";
@@ -298,14 +364,13 @@ public:
                     LOG_DEBUG << "msg_type: " << online_push.msg_type();
                     LOG_DEBUG << "created_at: " << online_push.created_at();
                     
-                    // 打印 DebugString
                     LOG_DEBUG << "DebugString: " << online_push.DebugString();
                     LOG_DEBUG << "Parsed as GroupMessagePush (online message)";
                     handleGroupPush(online_push);
                     break; // 解析成功，跳出
                 }
 
-                // 如果第一种失败，再尝试用第二种结构体解析 (用于离线消息)
+                // 如果第一种失败，再尝试用于离线消息
                 p::GroupChatMessage msg;
                 if (msg.ParseFromArray(body.data(), body.size())) {
                     LOG_DEBUG << "Parsed GroupChatMessage:";
@@ -432,6 +497,35 @@ public:
                 }
                 break;
             }
+            case p::MSG_PENDING_REQUESTS:
+            {
+                p::PendingRequestsResponse resp;
+                if(resp.ParseFromArray(body.data(), body.size())) {
+                    if(msg_callback_) {
+                        int count = resp.requests_size();
+                        if (count == 0) {
+                            msg_callback_("待处理的入群申请: (0条)");
+                        } else {
+                            std::string out = "待处理的入群申请 (" + std::to_string(count) + "条):";
+                            for (int i = 0; i < count; ++i) {
+                                const auto& r = resp.requests(i);
+                                std::string uname = r.from_username();
+                                if (uname.empty()) {
+                                    uname = std::to_string(r.from_uid());
+                                }
+                                out += "\n  请求ID: " + std::to_string(r.request_id()) +
+                                       ", 来自: " + uname + " (ID:" + std::to_string(r.from_uid()) + ")";
+                                if (!r.message().empty()) {
+                                    out += ", 附言: " + r.message();
+                                }
+                                out += " — 使用 /approve " + std::to_string(r.request_id()) + " true/false 处理";
+                            }
+                            msg_callback_(out);
+                        }
+                    }
+                }
+                break;
+            }
             case p::MSG_HISTORY:
             {
                 p::HistoryResponse resp;
@@ -442,17 +536,22 @@ public:
                             uint64_t from = m.from_uid();
                             std::string from_str = (from == user_.uid) ? "我" : std::to_string(from);
 
-                            std::string content = m.content();
-                            if(content.empty()) {
-                                content = "空消息";
-                            }
-
                             uint64_t time = m.created_at();
                             std::string time_str = std::to_string(time);
 
-                            uint64_t msg_id = m.msg_id();
-                            out += "\n [" + time_str +  "]" + from_str + ":" + content + "(ID: " + std::to_string(msg_id) + ")";
-
+                            if(m.msg_type() == 3) {
+                                // 文件消息
+                                out += "\n [" + time_str +  "]" + from_str + ": [文件] " + m.content() +
+                                       " (ID: " + m.file_id() + ")";
+                            }
+                            else {
+                                std::string content = m.content();
+                                if(content.empty()) {
+                                    content = "空消息";
+                                }
+                                uint64_t msg_id = m.msg_id();
+                                out += "\n [" + time_str +  "]" + from_str + ":" + content + "(ID: " + std::to_string(msg_id) + ")";
+                            }
                         }
                         msg_callback_(out);
                     }
@@ -466,7 +565,7 @@ public:
                     if(msg_callback_) {
                         std::string out = "群组历史消息";
                         for(auto& m : resp.messages()) {
-                            out += "\n [" + std::to_string(m.created_at()) + "] " + m.from_username() + m.content();
+                            out += "\n [" + std::to_string(m.created_at()) + "] " + m.from_username() + ": "+ m.content();
                         }
                         msg_callback_(out);
                     }
@@ -558,7 +657,6 @@ public:
                 }
                 break;
             }
-
             case p::MSG_FILE_UPLOAD_COMPLETE:
             {
                 db::FileUploadComplete complete;
@@ -567,7 +665,6 @@ public:
                 }
                 break;
             }
-
             case p::MSG_FILE_DOWNLOAD_RESP:
             {
                 db::FileDownloadResp resp;
@@ -576,7 +673,6 @@ public:
                 }
                 break;
             }
-
             case p::MSG_FILE_DOWNLOAD_CHUNK:
             {
                 db::FileDownloadChunk chunk;
@@ -585,7 +681,6 @@ public:
                 }
                 break;
             }
-
             case p::MSG_FILE_RESUME_RESP:
             {
                 db::FileResumeResp resp;
@@ -594,7 +689,6 @@ public:
                 }
                 break;
             }
-
             case p::MSG_GROUP_FILE_MESSAGE:
             {
                 db::FileMessage file_msg;
@@ -607,7 +701,7 @@ public:
                 }
                 break;
             }
-            case p::MSG_FILE_OFFLINE_LIST_RESP:
+            case p::MSG_FILE_OFFLINE_DOWNLOAD:
             {
                 db::FileOfflineListResp resp;
                 if (resp.ParseFromArray(body.data(), body.size())) {
@@ -720,47 +814,72 @@ public:
         return true;
     }
 
-    void sendHeartbeat() {
-        if(!user_.logged_in) {
-            return ;
-        }
-        p::Heartbeat hb;
-        hb.set_timestamp(tool::getTimestamp());
-        hb.set_client_time(tool::getTimestamp());
-        hb.set_seq(++heartbeat_seq_);
+    // void sendHeartbeat() {
+    //     if(!user_.logged_in) {
+    //         return ;
+    //     }
+    //     p::Heartbeat hb;
+    //     hb.set_timestamp(tool::getTimestamp());
+    //     hb.set_client_time(tool::getTimestamp());
+    //     hb.set_seq(++heartbeat_seq_);
 
-        p::MessageHeader header;
-        header.set_msg_type(p::MSG_HEARTBEAT);
-        header.set_timestamp(tool::getTimestamp());
+    //     p::MessageHeader header;
+    //     header.set_msg_type(p::MSG_HEARTBEAT);
+    //     header.set_timestamp(tool::getTimestamp());
 
-        auto data = proto::MessageCodec::encode(header, hb);
-        if(!data.empty()) {
-            sendData(data);
-        }
-    }
+    //     auto data = proto::MessageCodec::encode(header, hb);
+    //     if(!data.empty()) {
+    //         sendData(data);
+    //     }
+    // }
 
-    void startHeartbeat(int time) {
-        if(heartbeat_running_) {
-            return ;
-        }
-        heartbeat_interval_ = time;
-        heartbeat_running_ = true;
-        heartbeat_thread_ = std::thread([this]() {
-            while(heartbeat_running_ && user_.logged_in) {
-                std::this_thread::sleep_for(std::chrono::seconds(heartbeat_interval_));
-                if(user_.logged_in) {
-                    sendHeartbeat();
-                }
-            }
-        });
-    }
+    // void startHeartbeat(int time) {
+    //     if(heartbeat_running_) {
+    //         return ;
+    //     }
+    //     heartbeat_interval_ = time;
+    //     heartbeat_running_ = true;
+    //     heartbeat_thread_ = std::thread([this]() {
+    //         std::unique_lock<std::mutex> lock(heartbeat_mutex_);
+    //         while(heartbeat_running_) {
+    //             // 可被 stopHeartbeat 唤醒，避免关闭时 join 阻塞 heartbeat_interval 秒
+    //             heartbeat_cv_.wait_for(lock, std::chrono::seconds(heartbeat_interval_), [this] {
+    //                 return !heartbeat_running_;
+    //             });
+    //             if(!heartbeat_running_) {
+    //                 break;
+    //             }
+    //             lock.unlock();
+    //             if(user_.logged_in) {
+    //                 sendHeartbeat();
+    //             }
+    //             lock.lock();
+    //         }
+    //     });
+    // }
 
-    void stopHeartbeat() {
-        heartbeat_running_ = false;
-        if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
-    }
+    // void stopHeartbeat() {
+    //     {
+    //         std::lock_guard<std::mutex> lock(heartbeat_mutex_);
+    //         heartbeat_running_ = false;
+    //     }
+    //     heartbeat_cv_.notify_all();
+    //     if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
+    // }
 
     void Login(const std::string& username, const std::string& password, const std::string& device_id) {
+        // 连接已断开时自动重连，避免登录请求发送到已关闭的连接导致超时
+        if(!client_->isConnected()) {
+            if(!reconnect()) {
+                if(msg_callback_) {
+                    msg_callback_("[错误] 无法连接到服务器");
+                }
+                return;
+            }
+            user_.logged_in = false;
+            user_.uid = 0;
+        }
+
         p::LoginRequest req;
         req.set_username(username);
         req.set_password(password);
@@ -772,13 +891,15 @@ public:
 
         auto data = proto::MessageCodec::encode(header, req);
         if(!data.empty()) {
+            // 先置位再发送，避免响应在置位前到达导致丢失唤醒
+            {
+                std::lock_guard<std::mutex> lock(login_mutex_);
+                login_response_received_ = false;
+            }
             sendData(data);
         }
 
-        
-
         std::unique_lock<std::mutex> lock(login_mutex_);
-        login_response_received_ = false;
         login_cv_.wait_for(lock, std::chrono::seconds(5), [this] {return login_response_received_;});
         if(!login_response_received_) {
             if(msg_callback_) {
@@ -789,6 +910,15 @@ public:
 
     void registerUser(const std::string& username, const std::string& password, const std::string& email, const std::string& nickname) {
         LOG_DEBUG << "registeruser called";
+        if(!client_->isConnected()) {
+            if(!reconnect()) {
+                if(msg_callback_) {
+                    msg_callback_("[错误] 无法连接到服务器");
+                }
+                return;
+            }
+        }
+
         p::RegisterRequest req;
         req.set_username(username);
         req.set_password(password);
@@ -807,7 +937,7 @@ public:
 
     void deleteUser(const std::string& password) {
         if(!user_.logged_in) {
-            std::cout << "[错误] 未登录" << std::endl;
+            LOG_ERROR << "[错误] 未登录";
             return ;
         }
 
@@ -831,6 +961,13 @@ public:
             }
         }
 
+        // 先置位再发送，避免响应在置位前到达导致丢失唤醒
+        {
+            std::lock_guard<std::mutex> lock(delete_mutex_);
+            delete_response_received_ = false;
+            delete_success_ = false;
+        }
+
         if(!sendData(data)) {
             if(msg_callback_) {
                 msg_callback_("[错误] 发送失败");
@@ -840,10 +977,7 @@ public:
 
         {
             std::unique_lock<std::mutex> lock(delete_mutex_);
-            delete_response_received_ = false;
-            delete_success_ = false;
-
-            bool result = delete_cv_.wait_for(lock, std::chrono::seconds(5),[this]() -> bool { return delete_response_received_; });
+            bool result = delete_cv_.wait_for(lock, std::chrono::seconds(30),[this]() -> bool { return delete_response_received_; });
             
             if(!result) {
                 if(msg_callback_) {
@@ -853,6 +987,7 @@ public:
             }
         }
         if(delete_success_) {
+            LOG_INFO << "deleteUser: success, showing confirmation";
             if(msg_callback_) {
                 msg_callback_("[系统] 账户删除成功");
             }
@@ -890,7 +1025,7 @@ public:
             sendData(data);
         }
         user_.logged_in = false;
-        stopHeartbeat();
+        //stopHeartbeat();
     }
     
     void sendprivateChat(uint64_t to_uid, const std::string& content, int msg_type = 1) {
@@ -1364,7 +1499,7 @@ public:
         db::FileResumeReq req;
         req.set_file_id(file_id);
         req.set_direction(direction);
-        req.set_request_id(req_id);   // 回显请求ID
+        req.set_request_id(req_id);
 
         p::MessageHeader header;
         header.set_msg_type(p::MSG_FILE_RESUME_REQ);
@@ -1415,7 +1550,7 @@ public:
         std::string filename = file_path.substr(file_path.find_last_of("/\\") + 1);
         std::string md5 = MD5Tool::calculateFile(file_path);
 
-        std::string file_id = md5 + "_" + std::to_string(user_.uid) + "_" + filename;
+        std::string file_id = md5 + "_" + std::to_string(user_.uid);
 
         // 查询断点偏移
         uint64_t start_offset = 0;
@@ -1454,7 +1589,7 @@ public:
         db::FileUploadReq req;
         req.mutable_file_info()->CopyFrom(info);
         req.set_chunk_size(64 * 1024);
-        req.set_request_id(req_id);  // 需确保 proto 支持
+        req.set_request_id(req_id);
 
         p::MessageHeader header;
         header.set_msg_type(p::MSG_FILE_UPLOAD_REQ);
@@ -1481,7 +1616,11 @@ public:
             if(msg_callback_) msg_callback_("[错误] 服务端拒绝上传: " + meta.error_msg);
             return;
         }
-        // 若服务端分配了新的 file_id，则使用它
+        if(meta.is_duplicate) {
+            if(msg_callback_) msg_callback_("[文件] 已有相同文件，ID: " + meta.existing_file_id);
+            return;
+        }
+        // 若服务端分配了新的file_id，则使用它
         if(!meta.file_id.empty())
             file_id = meta.file_id;
         if(meta.resume_offset > start_offset)
@@ -1510,11 +1649,11 @@ public:
         std::string md5 = MD5Tool::calculateFile(file_path);
 
         // 生成文件ID
-        std::string file_id = md5 + "_" + std::to_string(user_.uid) + "_" + filename;
+        std::string file_id = md5 + "_" + std::to_string(user_.uid);
 
-        // 查询断点偏移（复用私聊的断点查询，但需区分方向/类型）
+        // 查询断点偏移
         uint64_t start_offset = 0;
-        if(getResumeOffset(file_id, 2, start_offset)) { // direction=2 表示群组上传
+        if(getResumeOffset(file_id, 2, start_offset)) {
             if(start_offset >= file_size) {
                 if(msg_callback_)
                     msg_callback_("[文件] 文件已完整上传，跳过");
@@ -1527,7 +1666,7 @@ public:
             start_offset = 0;
         }
 
-        // 发送元数据（包含 group_id）
+        // 发送元数据
         uint64_t req_id = next_request_id_.fetch_add(1);
         auto promise = std::make_shared<std::promise<UploadMetaResult>>();
         auto future = promise->get_future();
@@ -1542,21 +1681,20 @@ public:
         info.set_filename(filename);
         info.set_file_size(file_size);
         info.set_md5(md5);
-        info.set_to_uid(group_id);   // 群组ID放入to_uid（或使用专门字段）
+        info.set_group_id(group_id);
         info.set_from_uid(user_.uid);
         info.set_upload_time(tool::getTimestamp());
         info.set_expire_time(info.upload_time() + 7 * 24 * 3600 * 1000);
         info.set_status(0);
 
-        // 构造群组上传请求
-        db::GroupFileUploadReq req;   // 需要在 proto 中定义
+        // 构造群组上传请求通过file_info.group_id识别群聊
+        db::FileUploadReq req;
         req.mutable_file_info()->CopyFrom(info);
-        req.set_group_id(group_id);
         req.set_chunk_size(64 * 1024);
         req.set_request_id(req_id);
 
         p::MessageHeader header;
-        header.set_msg_type(p::MSG_GROUP_FILE_UPLOAD_REQ);
+        header.set_msg_type(p::MSG_FILE_UPLOAD_REQ);
         header.set_timestamp(tool::getTimestamp());
         auto data = proto::MessageCodec::encode(header, req);
         if(data.empty() || !sendData(data)) {
@@ -1580,16 +1718,81 @@ public:
             if (msg_callback_) msg_callback_("[错误] 服务端拒绝上传: " + meta.error_msg);
             return;
         }
+        if(meta.is_duplicate) {
+            if(msg_callback_) msg_callback_("[文件] 已有相同文件，ID: " + meta.existing_file_id);
+            return;
+        }
         if(!meta.file_id.empty())
             file_id = meta.file_id;
         if(meta.resume_offset > start_offset)
             start_offset = meta.resume_offset;
 
-        // 分块发送（复用私聊的分块发送，但使用不同的消息类型）
+        // 分块发送
         sendGroupFileChunks(file_id, group_id, file_path, start_offset);
     }
 
-    void downloadFile(const std::string& file_id) {
+    // 从file_id中提取MD5
+    static std::string md5FromFileId(const std::string& file_id) {
+        if(file_id.size() >= 32) {
+            std::string prefix = file_id.substr(0, 32);
+            bool all_hex = true;
+            for(char c : prefix) {
+                if(!std::isxdigit(static_cast<unsigned char>(c))) {
+                    all_hex = false;
+                    break;
+                }
+            }
+            if(all_hex) return prefix;
+        }
+        return "";
+    }
+
+    static std::string normalizeFileId(const std::string& id) {
+        std::string s = id;
+        size_t begin = s.find_first_not_of(" \t\r\n");
+        if(begin == std::string::npos) return "";
+        size_t end = s.find_last_not_of(" \t\r\n");
+        s = s.substr(begin, end - begin + 1);
+        if(s.size() > 3 && (s[0] == 'I' || s[0] == 'i') && (s[1] == 'D' || s[1] == 'd') && s[2] == ':') {
+            s = s.substr(3);
+            size_t b2 = s.find_first_not_of(" \t\r\n");
+            if(b2 == std::string::npos) return "";
+            s = s.substr(b2);
+        }
+        return s;
+    }
+
+    // 在本地目录查找是否已下载过相同内容的文件，返回其file_id
+    static std::string findLocalFileByMD5(const std::string& md5) {
+        if(md5.empty()) return "";
+        std::error_code ec;
+        for(const auto& entry : std::filesystem::directory_iterator(".", ec)) {
+            if(ec) break;
+            if(!entry.is_regular_file()) continue;
+            std::string name = entry.path().filename().string();
+            if(name.size() > 4 &&
+               name.compare(name.size() - 4, 4, ".dat") == 0 &&
+               name.compare(0, md5.size(), md5) == 0) {
+                return name.substr(0, name.size() - 4);
+            }
+        }
+        return "";
+    }
+
+    void downloadFile(const std::string& raw_file_id) {
+        std::string file_id = normalizeFileId(raw_file_id);
+
+        // 下载去重：若本地磁盘已存在相同内容的文件，则不再重复下载
+        std::string md5 = md5FromFileId(file_id);
+        if(!md5.empty()) {
+            std::string existing = findLocalFileByMD5(md5);
+            if(!existing.empty()) {
+                if(msg_callback_)
+                    msg_callback_("[文件] 已有相同文件，ID: " + existing);
+                return;
+            }
+        }
+
         uint64_t start_offset = 0;
         if(!getResumeOffset(file_id, 1, start_offset)) {
             start_offset = 0;
@@ -1616,9 +1819,7 @@ public:
 
     void sendFileChunks(const std::string& file_id, const std::string& file_path, uint64_t start_offset) {
         const uint32_t CHUNK_SIZE = 64 * 1024;
-        const int MAX_RETRIES = 3;
-        const int ACK_TIMEOUT_MS = 3000; // 3秒
-
+        //int chunk_count = 0;
         std::ifstream file(file_path, std::ios::binary);
         if(!file) {
             if(msg_callback_) msg_callback_("[错误] 无法打开文件: " + file_path);
@@ -1638,85 +1839,42 @@ public:
         while(file) {
             file.read(buffer.data(), CHUNK_SIZE);
             std::streamsize bytes_read = file.gcount();
-            if(bytes_read == 0) break;
+            if(bytes_read <= 0) break;
 
-            bool chunk_sent = false;
-            for(int retry = 0; retry < MAX_RETRIES && !chunk_sent; ++retry) {
-                // 生成唯一请求ID
-                uint64_t req_id = next_request_id_.fetch_add(1);
-                // 创建Promise并存入映射
-                auto ack_promise = std::make_shared<std::promise<bool>>();
-                auto ack_future = ack_promise->get_future();
-                {
-                    std::lock_guard<std::mutex> lock(chunk_ack_mutex_);
-                    pending_chunk_acks_[req_id] = ack_promise;
-                }
+            // 通过peek判断最后一块，正确处理文件大小为块大小整数倍的情况
+            bool is_last = (file.peek() == EOF);
 
-                // 3. 构造分片消息
-                db::FileChunk chunk;
-                chunk.set_file_id(file_id);
-                chunk.set_chunk_index(chunk_index);
-                chunk.set_offset(current_offset);
-                chunk.set_data(buffer.data(), bytes_read);
-                chunk.set_is_last(file.eof() && (bytes_read < CHUNK_SIZE));
+            db::FileUploadChunk chunk;
+            chunk.set_file_id(file_id);
+            chunk.set_chunk_index(chunk_index);
+            chunk.set_offset(current_offset);
+            chunk.set_data(buffer.data(), bytes_read);
+            chunk.set_is_last(is_last);
 
-                p::MessageHeader header;
-                header.set_msg_type(p::MSG_FILE_UPLOAD_CHUNK);
-                header.set_timestamp(tool::getTimestamp());
-                header.set_request_id(req_id); // 关键：回显ID
+            p::MessageHeader header;
+            header.set_msg_type(p::MSG_FILE_UPLOAD_CHUNK);
+            header.set_timestamp(tool::getTimestamp());
 
-                auto data = proto::MessageCodec::encode(header, chunk);
-                if(data.empty() || !sendData(data)) {
-                    // 发送失败，清理Promise
-                    std::lock_guard<std::mutex> lock(chunk_ack_mutex_);
-                    pending_chunk_acks_.erase(req_id);
-                    LOG_ERROR << "Send chunk failed at offset " << current_offset 
-                            << ", retry " << retry+1 << "/" << MAX_RETRIES;
-                    // 等待短暂时间后重试
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100 * (retry + 1)));
-                    continue;
-                }
-
-                // 等待ACK
-                auto status = ack_future.wait_for(std::chrono::milliseconds(ACK_TIMEOUT_MS));
-                if(status == std::future_status::timeout) {
-                    std::lock_guard<std::mutex> lock(chunk_ack_mutex_);
-                    pending_chunk_acks_.erase(req_id);
-                    LOG_ERROR << "ACK timeout for offset " << current_offset 
-                            << ", retry " << retry+1 << "/" << MAX_RETRIES;
-                    continue;
-                }
-
-                // 获取ACK结果
-                bool ack_success = ack_future.get();
-                if(!ack_success) {
-                    LOG_ERROR << "Server rejected chunk at offset " << current_offset 
-                            << ", retry " << retry+1 << "/" << MAX_RETRIES;
-                    continue;
-                }
-
-                // 成功
-                chunk_sent = true;
-                LOG_DEBUG << "Chunk offset " << current_offset << " confirmed.";
-            }
-
-            if(!chunk_sent) {
-                // 重试耗尽，上报错误并退出
-                if (msg_callback_) {
-                    msg_callback_("[错误] 分片上传失败，偏移 " + std::to_string(current_offset) +
-                                "，已发送 " + std::to_string(current_offset - start_offset) + " 字节");
-                }
-                LOG_ERROR << "Upload aborted at offset " << current_offset;
+            auto data = proto::MessageCodec::encode(header, chunk);
+            if(data.empty() || !sendData(data)) {
+                if(msg_callback_)
+                    msg_callback_("[错误] 分片上传失败，偏移 " + std::to_string(current_offset));
                 return;
             }
 
-            // 更新偏移和索引
             current_offset += bytes_read;
             chunk_index++;
+
+            // chunk_count++;
+            // if(chunk_count % 20 == 0) {
+            //     sendHeartbeat();
+            // }
+
+            // 轻微限速，免瞬间塞满服务端接收缓冲
         }
 
         // 全部发送完成
-        LOG_INFO << "File upload finished: " << file_id 
+        LOG_INFO << "File upload finished: " << file_id
                 << ", total sent " << (current_offset - start_offset) << " bytes";
         if(msg_callback_) {
             msg_callback_("[文件] 上传完成，共 " + std::to_string(current_offset - start_offset) + " 字节");
@@ -1725,8 +1883,6 @@ public:
 
     void sendGroupFileChunks(const std::string& file_id, uint64_t group_id, const std::string& file_path, uint64_t start_offset) {
         const uint32_t CHUNK_SIZE = 64 * 1024;
-        const int MAX_RETRIES = 3;
-        const int ACK_TIMEOUT_MS = 3000;
 
         std::ifstream file(file_path, std::ios::binary);
         if(!file) {
@@ -1742,66 +1898,41 @@ public:
         uint32_t chunk_index = static_cast<uint32_t>(start_offset / CHUNK_SIZE);
         uint64_t current_offset = start_offset;
         std::vector<char> buffer(CHUNK_SIZE);
-
+        //int chunk_count = 0;
+        
         while(file) {
             file.read(buffer.data(), CHUNK_SIZE);
             std::streamsize bytes_read = file.gcount();
-            if (bytes_read == 0) break;
+            if (bytes_read <= 0) break;
 
-            bool chunk_sent = false;
-            for(int retry = 0; retry < MAX_RETRIES && !chunk_sent; ++retry) {
-                uint64_t req_id = next_request_id_.fetch_add(1);
-                auto ack_promise = std::make_shared<std::promise<bool>>();
-                auto ack_future = ack_promise->get_future();
+            bool is_last = (file.peek() == EOF);
 
-                {
-                    std::lock_guard<std::mutex> lock(chunk_ack_mutex_);
-                    pending_chunk_acks_[req_id] = ack_promise;
-                }
+            db::FileUploadChunk chunk;
+            chunk.set_file_id(file_id);
+            chunk.set_chunk_index(chunk_index);
+            chunk.set_offset(current_offset);
+            chunk.set_data(buffer.data(), bytes_read);
+            chunk.set_is_last(is_last);
 
-                // 构造群组分块消息
-                db::GroupFileChunk chunk;   // 需要在 proto 中定义
-                chunk.set_file_id(file_id);
-                chunk.set_chunk_index(chunk_index);
-                chunk.set_offset(current_offset);
-                chunk.set_data(buffer.data(), bytes_read);
-                chunk.set_is_last(file.eof() && (bytes_read < CHUNK_SIZE));
+            p::MessageHeader header;
+            header.set_msg_type(p::MSG_FILE_UPLOAD_CHUNK);
+            header.set_timestamp(tool::getTimestamp());
 
-                p::MessageHeader header;
-                header.set_msg_type(p::MSG_GROUP_FILE_UPLOAD_CHUNK);
-                header.set_timestamp(tool::getTimestamp());
-                header.set_request_id(req_id);
-
-                auto data = proto::MessageCodec::encode(header, chunk);
-                if(data.empty() || !sendData(data)) {
-                    std::lock_guard<std::mutex> lock(chunk_ack_mutex_);
-                    pending_chunk_acks_.erase(req_id);
-                    LOG_ERROR << "Send group chunk failed at offset " << current_offset;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100 * (retry + 1)));
-                    continue;
-                }
-
-                auto status = ack_future.wait_for(std::chrono::milliseconds(ACK_TIMEOUT_MS));
-                if(status == std::future_status::timeout) {
-                    std::lock_guard<std::mutex> lock(chunk_ack_mutex_);
-                    pending_chunk_acks_.erase(req_id);
-                    continue;
-                }
-                bool ack_success = ack_future.get();
-                if (!ack_success) continue;
-
-                chunk_sent = true;
-                LOG_DEBUG << "Group chunk offset " << current_offset << " confirmed.";
-            }
-
-            if(!chunk_sent) {
-                if(msg_callback_) {
+            auto data = proto::MessageCodec::encode(header, chunk);
+            if(data.empty() || !sendData(data)) {
+                if (msg_callback_)
                     msg_callback_("[错误] 群组分片上传失败，偏移 " + std::to_string(current_offset));
-                }
                 return;
             }
+
             current_offset += bytes_read;
             chunk_index++;
+
+            // chunk_count++;
+            // if (chunk_count % 20 == 0) {
+            //     sendHeartbeat();  // 主动心跳
+            // }
+
         }
 
         LOG_INFO << "Group file upload finished: " << file_id;
@@ -1820,8 +1951,15 @@ public:
         auto it = downloading_files_.find(file_id);
         if(it == downloading_files_.end()) {
             std::string temp_filename = file_id + ".tmp";
-            // 以读写模式打开，若不存在则创建
-            std::ofstream fs(temp_filename, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
+            std::ofstream fs;
+            if (offset > 0) {
+                // 断点续传：保留已写入的内容，避免 trunc 破坏前半部分
+                fs.open(temp_filename, std::ios::binary | std::ios::in | std::ios::out);
+            }
+            if (!fs.is_open()) {
+                // 从头下载或文件不存在：新建（存在则截断）
+                fs.open(temp_filename, std::ios::binary | std::ios::out | std::ios::trunc);
+            }
             if(!fs) {
                 if (msg_callback_) msg_callback_("[错误] 无法创建文件: " + temp_filename);
                 return;
@@ -1857,7 +1995,14 @@ public:
         if (is_last) {
             fs.close();
             std::string temp_name = file_id + ".tmp";
-            std::string final_name = file_id + ".dat";
+            std::string final_name;
+            auto map_it = download_filename_map_.find(file_id);
+            if (map_it != download_filename_map_.end() && !map_it->second.empty()) {
+                final_name = map_it->second;
+            }
+            else {
+                final_name = file_id + ".dat";
+            }
             // 删除已存在的同名文件
             if(remove(final_name.c_str()) != 0 && errno != ENOENT) {
                 if(msg_callback_) msg_callback_("[错误] 删除旧文件失败: " + final_name);
@@ -1868,6 +2013,7 @@ public:
             else {
                 if (msg_callback_) msg_callback_("[文件] 下载完成: " + final_name);
             }
+            download_filename_map_.erase(file_id);
             downloading_files_.erase(it);
         }
     }
@@ -1876,7 +2022,7 @@ public:
         db::FileOfflineListReq req;
         req.set_limit(100);
         p::MessageHeader header;
-        header.set_msg_type(p::MSG_FILE_OFFLINE_LIST_REQ);
+        header.set_msg_type(p::MSG_FILE_OFFLINE_DOWNLOAD);
         header.set_timestamp(tool::getTimestamp());
         auto data = proto::MessageCodec::encode(header, req);
         if(!data.empty()) {
@@ -1886,8 +2032,32 @@ public:
 
     // 文件上传响应
     void handleFileUploadResp(const db::FileUploadResp& resp) {
+        // 解析等待中的元数据请求
+        std::shared_ptr<std::promise<UploadMetaResult>> promise;
+        {
+            std::lock_guard<std::mutex> lock(upload_meta_mutex_);
+            if(!pending_meta_requests_.empty()) {
+                auto it = pending_meta_requests_.begin();
+                promise = it->second;
+                pending_meta_requests_.erase(it);
+            }
+        }
+        if(promise) {
+            UploadMetaResult result;
+            result.success = resp.success();
+            result.is_duplicate = resp.is_duplicate();
+            result.file_id = resp.file_id();
+            result.existing_file_id = resp.existing_file_id();
+            result.resume_offset = resp.uploaded_size();
+            result.error_msg = resp.message();
+            promise->set_value(result);
+        }
+
         if(msg_callback_) {
-            if(resp.success()) {
+            if(resp.is_duplicate()) {
+                msg_callback_("[文件] 已有相同文件，ID: " + resp.existing_file_id());
+            }
+            else if(resp.success()) {
                 msg_callback_("[文件] 上传准备就绪，file_id=" + resp.file_id() +
                             ", 已上传=" + std::to_string(resp.uploaded_size()));
             }
@@ -1914,6 +2084,7 @@ public:
     void handleFileDownloadResp(const db::FileDownloadResp& resp) {
         if(msg_callback_) {
             if(resp.success()) {
+                download_filename_map_[resp.file_id()] = resp.filename();
                 msg_callback_("[文件] 开始下载: " + resp.filename() +
                             " (ID: " + resp.file_id() + ") 大小=" + std::to_string(resp.file_size()));
             }
@@ -1937,13 +2108,22 @@ public:
 
     // 断点续传响应
     void handleFileResumeResp(const db::FileResumeResp& resp) {
-        if(msg_callback_) {
-            if(resp.success()) {
-                msg_callback_("[文件] 续传偏移: " + std::to_string(resp.offset()));
+        // 解析等待中的续传请求）
+        std::shared_ptr<std::promise<ResumeResult>> promise;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            if(!pending_requests_.empty()) {
+                auto it = pending_requests_.begin();
+                promise = it->second;
+                pending_requests_.erase(it);
             }
-            else {
-                msg_callback_("[文件] 续传查询失败: " + resp.message());
-            }
+        }
+        if(promise) {
+            ResumeResult result;
+            result.success = resp.success();
+            result.offset = resp.offset();
+            result.error_code = 0;
+            promise->set_value(result);
         }
     }
 
@@ -1965,13 +2145,14 @@ public:
     }
 
     void handleDeleteAccountResponse(const p::CommonResponse& resp) {
+        LOG_INFO << "handleDeleteAccountResponse: code=" << resp.code() << ", msg=" << resp.message();
         std::lock_guard<std::mutex> lock(delete_mutex_);
         delete_response_received_ = true;
         delete_success_ = (resp.code() == 0);
 
         if(!delete_success_) {
             if(msg_callback_) {
-                msg_callback_("[错误] 删除失败");
+                msg_callback_("[错误] 删除失败: " + resp.message());
             }
         }
         delete_cv_.notify_one();
@@ -1999,12 +2180,56 @@ public:
         }
     }
 
+    void setCurMod(uint64_t target, bool is_group) {
+        cur_target = target;
+        cur_mod = is_group ? MODE_GROUP : MODE_PRIVATE;
+        if(msg_callback_) {
+            std::string type = is_group ? "群组" : "用户";
+            msg_callback_("[系统] 已切换到" + type + "聊天， 目标用户: " + std::to_string(target) + "(直接发送消息即可) (输入/back退出)");
+        }
+        // 进入会话时标记该会话已读
+        if(is_group) {
+            markGroupRead(target);
+        } else {
+            markRead(target);
+        }
+    }
+
+    void cleanChatMod() {
+        cur_mod = MODE_NONE;
+        cur_target = 0;
+        if(msg_callback_) {
+            msg_callback_("[系统] 退出当前的聊天, 回到用户界面");
+        }
+    }
+
+    bool isInChatMode() const{
+        return cur_mod != MODE_NONE;
+    }
+
+    bool isInPrivate() const{
+        return cur_mod == MODE_PRIVATE;
+    }
+
+    bool isInGroupChat() const {
+        return cur_mod == MODE_GROUP;
+    }
+
+    uint64_t getCurTarget() const {
+        return cur_target;
+    }
+
 private:
     std::unique_ptr<TLSClient> client_;
     std::thread recv_thread_;
     std::mutex login_mutex_;
     std::mutex file_mutex_;
     std::condition_variable login_cv_;
+    std::string host_;
+    uint16_t port_ = 0;
+    bool use_tls_ = false;
+    std::string cert_file_;
+    std::string key_file_;
     std::vector<ConversationInfo> conversation_list_;
     std::vector<uint64_t> block_list_;
     std::unordered_map<std::string, std::ofstream> downloading_files_;
@@ -2012,6 +2237,8 @@ private:
     bool running = false;
     std::atomic<bool> pre_login_heartbeat_running_{false};
     std::thread pre_login_heartbeat_thread_;
+    std::mutex pre_login_mutex_;
+    std::condition_variable pre_login_cv_;
 
     UserInfo user_;
 
@@ -2025,6 +2252,8 @@ private:
     std::atomic<bool> heartbeat_running_{false};
     std::atomic<bool> connected_{false};
     std::thread heartbeat_thread_;
+    std::mutex heartbeat_mutex_;
+    std::condition_variable heartbeat_cv_;
     uint64_t heartbeat_seq_ = 0;
 
     std::condition_variable delete_cv_;
@@ -2040,6 +2269,15 @@ private:
     std::unordered_map<uint64_t, std::shared_ptr<std::promise<UploadMetaResult>>> pending_meta_requests_;
     std::mutex chunk_ack_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<std::promise<bool>>> pending_chunk_acks_;
+    std::unordered_map<std::string, std::string> download_filename_map_;
+
+    enum ChatMod {
+        MODE_NONE,
+        MODE_PRIVATE,
+        MODE_GROUP
+    };
+    ChatMod cur_mod = MODE_NONE;
+    uint64_t cur_target = 0; // 目标ID
 
     void handleLoginResponse(const p::LoginResponse& resp) {
         std::lock_guard<std::mutex> lock(login_mutex_);
@@ -2055,8 +2293,8 @@ private:
                 msg_callback_("[系统] 登录成功， 用户：" + resp.nickname() + ", 用户ID：" + std::to_string(user_.uid));
             }
 
-            stopPreLoginHeartbeat();
-            startHeartbeat(15);
+            // stopPreLoginHeartbeat();
+            // startHeartbeat(15);
             
             getFriendList();
             getConversationList();
@@ -2100,6 +2338,11 @@ private:
             }
 
             msg_callback_("[私聊] " + from_str + ": " + content + "(ID: " + std::to_string(msg_id) + ")");
+
+            // 收到消息时若正与对方聊天，则自动标记已读
+            if (from != user_.uid && isInPrivate() && getCurTarget() == from) {
+                markRead(from);
+            }
         }
     }
 
@@ -2132,6 +2375,11 @@ private:
             }
             std::string display_content = content.empty() ? "(空消息)" : content;
             msg_callback_("[群聊] " + std::to_string(push.group_id()) + " " + std::to_string(from_uid) + ": " + content);
+
+            // 收到群消息时若正查看该群，则自动标记已读
+            if (isInGroupChat() && getCurTarget() == group_id) {
+                markGroupRead(group_id);
+            }
         }
     }
 
@@ -2144,6 +2392,11 @@ private:
             }
             // 注意：GroupChatMessage 中的字段是 group_uid
             msg_callback_("[群聊] " + std::to_string(msg.group_uid()) + " " + from + ": " + content);
+
+            // 离线群消息同样标记已读
+            if (isInGroupChat() && getCurTarget() == msg.group_uid()) {
+                markGroupRead(msg.group_uid());
+            }
         }
     }
 

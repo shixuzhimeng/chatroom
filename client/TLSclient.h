@@ -13,7 +13,7 @@
 #include <memory>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include "../logging.h"
+#include "tool/logging.h"
 #include <sys/epoll.h>
 
 class TLSClient {
@@ -63,7 +63,6 @@ public:
         }
 
         if(ret == 0) {
-            fcntl(fd_, F_SETFL, flags);
             LOG_INFO << "connected success";
             goto connected;
         }
@@ -105,7 +104,6 @@ public:
                 fd_ = -1;
                 return false;
             }
-            fcntl(fd_, F_SETFL, flags);
         }
 
     connected:
@@ -202,28 +200,35 @@ public:
             return ;
         }
         char temp[64 * 1024];
-        int n = readData(temp, sizeof(temp));
+        // 边沿触发下必须一次把 socket 缓冲读空，否则剩余数据不会再触发事件
+        while (true) {
+            int n = readData(temp, sizeof(temp));
 
-        if(n > 0) {
-            recv_buffer_.insert(recv_buffer_.end(), temp, temp + n);
-            processMessage();
-        }
-        else if(n == 0) {
-            LOG_INFO << "Server closed connected";
-            disconnect();
-            if(close_cb_) {
-                close_cb_();
+            if(n > 0) {
+                recv_buffer_.insert(recv_buffer_.end(), temp, temp + n);
+                continue;
             }
-        }
-        else {
-            if(errno != EAGAIN && errno != EWOULDBLOCK) {
+            else if(n == 0) {
+                LOG_INFO << "Server closed connected";
+                disconnect();
+                if(close_cb_) {
+                    close_cb_();
+                }
+                return;
+            }
+            else {
+                if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
                 LOG_ERROR << "read error: " << strerror(errno);
                 disconnect();
                 if(close_cb_) {
                     close_cb_();
                 }
+                return;
             }
         }
+        processMessage();
     }
 private:
     int fd_;
@@ -271,7 +276,7 @@ private:
                 return;
             }
             
-            // 【关键修改】完整数据包大小
+            // 完整数据包大小
             size_t packet_size = sizeof(uint32_t) * 2 + total_len;
             
             if(recv_buffer_.size() >= packet_size) {
