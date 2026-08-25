@@ -5,7 +5,7 @@
 #include <chrono>
 #include <functional>
 #include <vector>
-#include "logging.h"
+#include "tool/logging.h"
 #include "mysql/userDAO.h"
 
 class OnlineManager {
@@ -16,8 +16,12 @@ public:
         return instance;
     }
 
-    void setTimeoutCallback(std::function<void(uint64_t)> callback) {
-        timeout_callback_ = callback;
+    // void setTimeoutCallback(std::function<void(uint64_t)> callback) {
+    //     timeout_callback_ = callback;
+    // }
+
+    void setBusyCheckCallback(std::function<bool(uint64_t)> callback) {
+        busy_check_callback_ = callback;
     }
 
     // 用户主动上线
@@ -37,17 +41,17 @@ public:
     static constexpr int TIMEOUT = 90;
 
     // 更新心跳时间
-    void updateHeartbeat(uint64_t user_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        bool was_offline = (heartbeat_map.find(user_id) == heartbeat_map.end());
-        heartbeat_map[user_id] = std::chrono::steady_clock::now();
+    // void updateHeartbeat(uint64_t user_id) {
+    //     std::lock_guard<std::mutex> lock(mutex_);
+    //     bool was_offline = (heartbeat_map.find(user_id) == heartbeat_map.end());
+    //     heartbeat_map[user_id] = std::chrono::steady_clock::now();
         
-        if (was_offline) {
-            UserDAO dao;
-            dao.updateUserStatus(user_id, 1);
-            LOG_DEBUG << "User " << user_id << " came online (heartbeat)";
-        }
-    }
+    //     if (was_offline) {
+    //         UserDAO dao;
+    //         dao.updateUserStatus(user_id, 1);
+    //         LOG_DEBUG << "User " << user_id << " came online (heartbeat)";
+    //     }
+    // }
 
     // 检查用户是否在线
     bool isOnline(uint64_t user_id, int timeout_seconds = TIMEOUT) {
@@ -65,27 +69,36 @@ public:
 }
     // 超时检测清理离线用户
     void checkTimeout(int timeout_seconds = TIMEOUT) {
-        std::lock_guard<std::mutex> lock(mutex_);
         auto now = std::chrono::steady_clock::now();
         std::vector<uint64_t> to_offline;
-        
-        for (const auto& pair : heartbeat_map) {
-            uint64_t uid = pair.first;
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - pair.second).count();
-            if (elapsed >= timeout_seconds) {
-                to_offline.push_back(uid);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& pair : heartbeat_map) {
+                uint64_t uid = pair.first;
+                if (busy_check_callback_ && busy_check_callback_(uid)) {
+                    continue;
+                }
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - pair.second).count();
+                if (elapsed >= timeout_seconds) {
+                    to_offline.push_back(uid);
+                }
+            }
+
+            if (to_offline.empty()) {
+                return;
+            }
+
+            for (uint64_t uid : to_offline) {
+                heartbeat_map.erase(uid);
             }
         }
 
-        if (to_offline.empty()) {
-            return;
-        }
-
+        // 锁外执行 DB 写和回调，避免回调removeUser再次加锁导致死锁
         for (uint64_t uid : to_offline) {
-            heartbeat_map.erase(uid);
             UserDAO dao;
             dao.updateUserStatus(uid, 0);
-            
+
             if (timeout_callback_) {
                 timeout_callback_(uid);
             }
@@ -153,4 +166,5 @@ private:
     std::mutex mutex_;
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> heartbeat_map;
     std::function<void(uint64_t)> timeout_callback_;
+    std::function<bool(uint64_t)> busy_check_callback_;
 };

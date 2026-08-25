@@ -5,7 +5,7 @@
 #include "mysql/pingbiDAO.h"
 #include "mysql/userDAO.h"
 #include "mysql/baseDAO.h"
-#include "../logging.h"
+#include "tool/logging.h"
 #include "account/Manager.h"
 #include "OnlineManager.h"
 #include <unordered_set>
@@ -247,7 +247,6 @@ public:
                 if(friend_dao.addFriendship(user_id, block_id)) {
                     LOG_INFO << "Friendship restored between " << user_id << " and " << "block_id";
                     notifyUser(block_id, user_id, "User " + std::to_string(user_id) + "has unblocked you and restored friendship");
-                    notifyUser(user_id, block_id, "User " + std::to_string(user_id) + "has unblocked you and restored friendship");
                 }
             }
             sendCommonResponse(conn, header, true, "User unblocked");
