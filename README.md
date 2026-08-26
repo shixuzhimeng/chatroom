@@ -1,7 +1,90 @@
 # ChatRoom聊天室项目
-基于C++实现的TCP网络聊天室，采用主从Reactor模型，protobuf完成消息的序列化和反序列化，Mysql存储数据
+基于C++实现的TCP网络聊天室，支持多种业务操作，如聊天（私聊，群聊），文件传输，好友管理，群组管理等。
 
-## 客户端的使用命令 (注： `[]` 为可选选项)
+## 项目简介
+这个项目是一个完整的聊天室项目，采用主从Reactor模型，protobuf完成消息的序列化和反序列化，Mysql数据持久化存储，也可进行TLS通信加密，支持高并发链接。
+系统包括帐户管理、好友管理、群组管理、文件操作、消息收发等核心功能。
+
+## 主要特性
+- **网络模型**：基于epoll的主从Reactor模型，支持高并发
+- **通信协议**：protobuf序列化和反序列化
+- **数据存储**：MySQL+连接池，支持事务操作
+- **传输通信**：支持TLS通信加密（单向加密）
+- **消息管理**：私聊，群聊，离线消息，撤回消息，会话列表
+- **文件传输**：支持断点续传，文件MD5校验，离线文件
+- **好友系统**：好友添加/删除/拉黑，查看好友列表
+- **群组系统**：群组的创建/解散，成员管理，群组权限设置
+
+## 环境要求
+- **语言**：C++17
+- **序列化**：Google Protobuf 3.21+
+- **数据库**：MySQL 8.0+
+- **网络库**：Linux下原生epoll
+- **安全**：OpenSSL 1.1.1+
+- **日志**：Google Glog
+- **配置**：JSON
+- **UI**： ncurses
+
+## 项目目录结构
+```
+ChatRoom/
+├── account/           # 账号管理模块
+│   ├── Account.h      # 认证处理器
+│   ├── HashSalt.h     # 密码加密与盐值
+│   ├── Manager.h      # 会话管理
+│   └── yanzheng.h     # 验证码管理
+├── chat/              # 聊天模块
+│   ├── chathandle.h   # 私聊处理器
+│   └── groupmessagehandle.h  # 群聊处理器
+├── file/              # 文件模块
+│   ├── fileHandle.h   # 文件传输处理器
+│   ├── fileManage.h   # 文件管理 (存储/定期清理)
+│   └── md5.h          # MD5工具校验
+├── friend/            # 好友模块
+│   ├── FriendHandle.h # 好友关系处理器
+│   └── OnlineManager.h # 在线状态管理
+├── group/             # 群组模块
+│   └── grouphandle.h  # 群组处理器
+├── mysql/             # 数据库模块
+│   ├── baseDAO.h      # 数据库基类
+│   ├── mysqlPool.h    # 连接池
+│   ├── userDAO.h      # 用户DAO
+│   ├── friendDAO.h    # 好友DAO
+│   ├── groupDAO.h     # 群组DAO
+│   ├── messageDAO.h   # 消息DAO
+│   ├── groupmessageDAO.h # 群消息DAO
+│   ├── fileDAO.h      # 文件DAO
+│   └── pingbiDAO.h    # 屏蔽DAO
+├── net/               # 网络模块
+│   ├── epoll.h        # Epoll封装 & TCP连接（可选）
+│   ├── reactor.h      # Reactor模式实现（主从）
+│   └── thread_pool.h  # 线程池
+│   └── chat_server.h  # 服务端主类
+│   └── main.cpp       # 服务端入口
+├── protobuf/          # Protobuf定义
+│   ├── p.proto        # 网络协议定义
+│   ├── mysql.proto    # 数据库序列化定义
+│   ├── p.h            # 编解码器
+│   └── mysql_p.h      # 序列化工具
+├── TLS/               # TLS模块
+│   ├── TLS.h          # 服务端TLS
+├── tool/              # 工具模块
+│   ├── logging.h      # 日志封装
+│   ├── tool.h         # 通用工具
+│   ├── Check.h        # 输入验证
+│   ├── deduplicator.h # 消息去重
+│   └── limiter.h      # 频率限制
+├── JSON/              # 配置模块
+│   ├── Config.h       # 配置管理
+│   └── Config.json    # 配置文件
+├── client/            # 客户端
+│   ├──  chat_client.h # 客户端主类
+│   ├──  cmain.cpp     # 客户端入口
+│   ├──  ui.h          # 客户端UI (ncurses)（两版）
+│   └── TLSclient.h    # 客户端TLS
+```
+
+## 客户端的使用命令 (注： `[]` 为可选选项)（较为麻烦的一版）(cui这一版)
 ### 用户帐号相关
 /register <用户名> <密码> <邮箱> [昵称]	   注册新用户	  /register john 123456 john@email.com hhh
 /login <用户名> <密码> [设备ID]	           登录账号	     /login john 123456

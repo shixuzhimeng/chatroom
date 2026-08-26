@@ -435,6 +435,9 @@ message HistoryMessage {
     int64 created_at = 8;
     int64 delivered_at = 9;
     int64 read_at = 10;
+    string file_id = 11;    // 文件消息：文件ID
+    uint64 file_size = 12;  // 文件消息：文件大小
+    string md5 = 13;        // 文件消息：文件MD5
 }
 
 // 标记已读请求
