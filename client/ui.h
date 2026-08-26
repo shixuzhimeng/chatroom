@@ -1,7 +1,6 @@
 #pragma once
 
 #include <ncursesw/curses.h>
-
 #include <algorithm>
 #include <codecvt>
 #include <cwchar>
